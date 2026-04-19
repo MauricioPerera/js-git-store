@@ -1,0 +1,54 @@
+{
+  "name": "js-git-store",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Git-backed storage adapters for js-doc-store and js-vector-store — tree-first, blob-on-demand pattern.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:bench": "node tests/bench/cold-read.mjs && node tests/bench/vector-search.mjs",
+    "lint": "eslint src tests --ext .ts",
+    "prepack": "npm run build"
+  },
+  "dependencies": {},
+  "peerDependencies": {
+    "js-doc-store": "*",
+    "js-vector-store": "*"
+  },
+  "peerDependenciesMeta": {
+    "js-doc-store": { "optional": true },
+    "js-vector-store": { "optional": true }
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "@typescript-eslint/eslint-plugin": "^8.7.0",
+    "@typescript-eslint/parser": "^8.7.0",
+    "eslint": "^9.11.0",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "keywords": [
+    "git",
+    "storage",
+    "adapter",
+    "versioned",
+    "vector-store",
+    "doc-store",
+    "knowledge-base",
+    "content-addressable"
+  ],
+  "license": "MIT"
+}
