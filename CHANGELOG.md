@@ -4,6 +4,47 @@ All notable changes to this project will be documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [SemVer](https://semver.org/).
 
+## [1.0.1] — hardening + perf
+
+### Security
+
+- **Path-traversal rejection on every public write + preload.** `writeJson`, `writeBin`, `delete`, `invalidate`, `readJson`, `readBin`, `readBinShared`, and `preload` all call `assertSafeFilename` before touching the cache. Rejected: `..` / `.` segments, leading `/` or `\`, drive-letter prefixes (`C:/...`), null bytes, empty strings. Covered by 18 unit tests against the validator + 4 integration tests against the adapter surface (including hostile-caller-writes-nothing verification).
+- **`assertSafeFilename` also wired inside `GitLayer`** (`readIndexFile`, `readContentBlob`, `writeStaged`, `removeStaged`, `addBatch`) as defense-in-depth for any future internal callers.
+
+### Performance
+
+- **`preload()` parallelizes fetches.** Was serial (`for ... await loadOne(f)`). Now runs `Promise.all(filenames.map(loadOne))` after the initial init. Verified wall-clock < sum of individual fetches.
+- **In-flight coalescing on `loadOne`.** Two concurrent `preload` calls for the same filename share a single fetch. Validated: `gitstore.blob.fetch{result=ok}` counter = 1 after two parallel `preload(["a"])`.
+- **Batched `git add` per branch.** `persist()` was spawning one `git add` per dirty file; now it accumulates filenames per branch and spawns a single `git add --` invocation per branch. For a batch of 100 writes on Windows this saves ~20s of spawn overhead.
+- **`writeJson` caches the serialized string.** Previously stringified twice (once for `sizeBytes` accounting, once in `persist`). Now stored on the cache entry and reused.
+- **`readBinShared(filename)`** — new zero-copy variant of `readBin`. Returns a `Uint8Array` viewing the cached bytes (no memcpy). Documented contract: caller must not mutate or retain. `readBin` remains the safe default (copy semantics unchanged).
+
+### Observability
+
+- **`gitstore.persist` counter + `gitstore.persist.ms` histogram** added. Closes the gap noted in the code review: previously there was no way to count successful persists or measure their latency.
+
+### Architecture
+
+- **`core/` no longer imports from `adapters/`.** `exists()` moved to `src/core/fs-utils.ts`, `assertSafeFilename()` moved to `src/core/safe-filename.ts`. `adapters/git-store-internal.ts` re-exports both for back-compat. Direction is now strictly `adapters/` → `core/`.
+- **Consistent init handling.** All async operations (`preload`, `persist`, `push`, `refresh`) explicitly call `gitLayer.init()` before any branching logic. Removed the half-auto-init in `withWriteLock` that was causing a backpressure-check race (two concurrent `persist()` calls could both pass the check).
+
+### Tests
+
+- 27 new tests:
+  - 18 unit for `assertSafeFilename` (valid + invalid cases)
+  - 4 integration for path-traversal rejection on adapter surface (incl. "hostile caller cannot create files outside cacheDir")
+  - 2 integration for parallel preload + coalescing
+  - 1 for persist metrics emission
+  - 2 for `readBinShared` (view semantics + null-for-missing)
+- 125 tests total across 17 files.
+
+### Publish hygiene
+
+- **Upstream devDeps pinned to SHAs** instead of `#master`:
+  - `js-doc-store@76333acc87fb67af8c46aa56419b165703ce32c1`
+  - `js-vector-store@2acb20ec43ec49ca1878f8998b2037d26134e013`
+  - Prevents silent breakage when upstream master moves.
+
 ## [1.0.0] — stability
 
 ### Stability commitment

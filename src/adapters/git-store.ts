@@ -5,7 +5,7 @@ import { GitLayer } from "../core/git-layer.js";
 import { GitStoreError } from "../core/types.js";
 import type { Logger } from "../logger.js";
 import type { MetricsCollector } from "../metrics.js";
-import { type ResolvedConfig, isMissing, resolveConfig, toBuffer } from "./git-store-internal.js";
+import { type ResolvedConfig, assertSafeFilename, isMissing, resolveConfig, toBuffer } from "./git-store-internal.js";
 
 export interface GitStoreConfig {
   repoUrl: string;
@@ -39,6 +39,7 @@ export class GitStoreAdapter {
   private readonly router: BranchRouter;
   private readonly cache: CacheLayer;
   private readonly gitLayer: GitLayer;
+  private readonly inflight = new Map<string, Promise<void>>();
   private closed = false;
 
   constructor(config: GitStoreConfig) {
@@ -60,22 +61,23 @@ export class GitStoreAdapter {
     }, this.cfg.localCacheDir, this.cfg.logger, this.cfg.metrics);
   }
 
-  readJson<T = unknown>(filename: string): T | null { return this.cache.readJson<T>(filename); }
-  readBin(filename: string): ArrayBuffer | null { return this.cache.readBin(filename); }
-  writeJson(filename: string, data: unknown): void { this.cache.writeJson(filename, data); }
-  writeBin(filename: string, buffer: ArrayBuffer | Uint8Array): void { this.cache.writeBin(filename, toBuffer(buffer)); }
-  delete(filename: string): void { this.cache.delete(filename); }
-  invalidate(filename: string): boolean { return this.cache.invalidate(filename); }
+  readJson<T = unknown>(filename: string): T | null { assertSafeFilename(filename); return this.cache.readJson<T>(filename); }
+  readBin(filename: string): ArrayBuffer | null { assertSafeFilename(filename); return this.cache.readBin(filename); }
+  /** Zero-copy view — see CacheLayer.readBinShared() docstring before using. */
+  readBinShared(filename: string): Uint8Array | null { assertSafeFilename(filename); return this.cache.readBinShared(filename); }
+  writeJson(filename: string, data: unknown): void { assertSafeFilename(filename); this.cache.writeJson(filename, data); }
+  writeBin(filename: string, buffer: ArrayBuffer | Uint8Array): void { assertSafeFilename(filename); this.cache.writeBin(filename, toBuffer(buffer)); }
+  delete(filename: string): void { assertSafeFilename(filename); this.cache.delete(filename); }
+  invalidate(filename: string): boolean { assertSafeFilename(filename); return this.cache.invalidate(filename); }
   cacheBytes(): number { return this.cache.bytes(); }
   cacheEntryCount(): number { return this.cache.entryCount(); }
 
   async preload(filenames: readonly string[]): Promise<void> {
     this.ensureOpen();
+    for (const f of filenames) assertSafeFilename(f);
     await this.gitLayer.init();
-    for (const f of filenames) {
-      if (this.cache.has(f)) continue;
-      await this.loadOne(f);
-    }
+    const toLoad = filenames.filter((f) => !this.cache.has(f));
+    await Promise.all(toLoad.map((f) => this.loadOne(f)));
   }
 
   async persist(): Promise<void> {
@@ -87,20 +89,33 @@ export class GitStoreAdapter {
     }
     const dirty = this.cache.dirtyEntries();
     if (dirty.length === 0) return;
+    const persistStarted = Date.now();
     await this.gitLayer.withWriteLock(async () => {
-      const byBranch = new Map<Branch, string[]>();
+      const writesByBranch = new Map<Branch, string[]>();
       for (const [f, e] of dirty) {
         const b = this.router.branchOf(f);
-        if (e.deleted) await this.gitLayer.stageDelete(b, f);
-        else if (e.variant === "json") await this.gitLayer.stageFile(b, f, JSON.stringify(e.json));
-        else if (e.bin) await this.gitLayer.stageFile(b, f, e.bin);
-        const list = byBranch.get(b) ?? [];
-        list.push(f); byBranch.set(b, list);
+        if (e.deleted) {
+          await this.gitLayer.removeStaged(b, f);
+        } else if (e.variant === "json") {
+          await this.gitLayer.writeStaged(b, f, e.jsonSerialized ?? JSON.stringify(e.json));
+          const list = writesByBranch.get(b) ?? []; list.push(f); writesByBranch.set(b, list);
+        } else if (e.bin) {
+          await this.gitLayer.writeStaged(b, f, e.bin);
+          const list = writesByBranch.get(b) ?? []; list.push(f); writesByBranch.set(b, list);
+        }
       }
-      for (const [branch, files] of byBranch) await this.gitLayer.commitIfDirty(branch, files);
+      for (const [branch, files] of writesByBranch) await this.gitLayer.addBatch(branch, files);
+      const allFilesByBranch = new Map<Branch, string[]>();
+      for (const [f, _e] of dirty) {
+        const b = this.router.branchOf(f);
+        const list = allFilesByBranch.get(b) ?? []; list.push(f); allFilesByBranch.set(b, list);
+      }
+      for (const [branch, files] of allFilesByBranch) await this.gitLayer.commitIfDirty(branch, files);
       this.cache.commitDirty(dirty);
       if (this.cfg.pushOnPersist) await this.gitLayer.pushBoth();
     });
+    this.cfg.metrics.counter("gitstore.persist").inc(1);
+    this.cfg.metrics.histogram("gitstore.persist.ms").observe(Date.now() - persistStarted);
   }
 
   async push(): Promise<void> {
@@ -145,7 +160,16 @@ export class GitStoreAdapter {
     if (this.closed) throw new GitStoreError("ADAPTER_CLOSED", "adapter is closed");
   }
 
-  private async loadOne(filename: string): Promise<void> {
+  private loadOne(filename: string): Promise<void> {
+    if (this.cache.has(filename)) return Promise.resolve();
+    const running = this.inflight.get(filename);
+    if (running) return running;
+    const p = this.doLoadOne(filename).finally(() => this.inflight.delete(filename));
+    this.inflight.set(filename, p);
+    return p;
+  }
+
+  private async doLoadOne(filename: string): Promise<void> {
     const branch = this.router.branchOf(filename);
     const isJson = filename.endsWith(".json");
     const started = Date.now();

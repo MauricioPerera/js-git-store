@@ -7,7 +7,8 @@ import * as git from "./git.js";
 import { GitStoreError } from "./types.js";
 import type { Logger } from "../logger.js";
 import type { MetricsCollector } from "../metrics.js";
-import { exists } from "../adapters/git-store-internal.js";
+import { exists } from "./fs-utils.js";
+import { assertSafeFilename } from "./safe-filename.js";
 
 export interface GitLayerConfig {
   repoUrl: string;
@@ -85,10 +86,12 @@ export class GitLayer {
   dirFor(branch: Branch): string { return branch === "content" ? this.contentDir : this.indexDir; }
 
   async readIndexFile(filename: string): Promise<Buffer> {
+    assertSafeFilename(filename);
     return fs.readFile(join(this.indexDir, filename));
   }
 
   async readContentBlob(filename: string): Promise<Buffer> {
+    assertSafeFilename(filename);
     return git.showBlob(this.contentDir, "HEAD", filename, this.cfg.authResolver());
   }
 
@@ -103,18 +106,27 @@ export class GitLayer {
     });
   }
 
-  async stageFile(branch: Branch, filename: string, data: Buffer | string): Promise<void> {
-    const dir = this.dirFor(branch);
-    await atomicWriteFile(join(dir, filename), data);
-    await git.runGit(["add", "--", filename], { cwd: dir, timeoutMs: this.cfg.gitTimeoutMs });
+  /** Write a file's payload to the worktree atomically. Does NOT stage. */
+  async writeStaged(branch: Branch, filename: string, data: Buffer | string): Promise<void> {
+    assertSafeFilename(filename);
+    await atomicWriteFile(join(this.dirFor(branch), filename), data);
   }
 
-  async stageDelete(branch: Branch, filename: string): Promise<void> {
+  /** Remove a file from the index + worktree. Used for deletion. */
+  async removeStaged(branch: Branch, filename: string): Promise<void> {
+    assertSafeFilename(filename);
     const dir = this.dirFor(branch);
     try {
       await git.runGit(["rm", "--cached", "--quiet", "--ignore-unmatch", "--", filename], { cwd: dir, timeoutMs: this.cfg.gitTimeoutMs });
     } catch (err) { this.logger.debug("delete.index.skip", { filename, err: String(err) }); }
     await fs.unlink(join(dir, filename)).catch(() => {});
+  }
+
+  /** Stage a batch of filenames with one `git add` spawn per branch. */
+  async addBatch(branch: Branch, filenames: readonly string[]): Promise<void> {
+    if (filenames.length === 0) return;
+    for (const f of filenames) assertSafeFilename(f);
+    await git.runGit(["add", "--", ...filenames], { cwd: this.dirFor(branch), timeoutMs: this.cfg.gitTimeoutMs });
   }
 
   async commitIfDirty(branch: Branch, files: string[]): Promise<string | null> {

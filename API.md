@@ -111,8 +111,15 @@ class GitStoreAdapter {
   /** Stages JSON in cache as dirty. Does NOT touch git until persist() is called. */
   writeJson(filename: string, data: unknown): void;
 
-  /** Returns the raw blob from cache, or null if not preloaded. */
+  /** Returns the raw blob from cache as an isolated copy (safe to retain). Null if not preloaded. */
   readBin(filename: string): ArrayBuffer | null;
+
+  /**
+   * Zero-copy view over the cached bytes. Returned Uint8Array shares memory
+   * with the cache. MUST NOT mutate. MUST NOT retain past the next persist() /
+   * invalidate() / refresh() / close(). Null if not preloaded.
+   */
+  readBinShared(filename: string): Uint8Array | null;
 
   /** Stages a binary payload in cache as dirty. */
   writeBin(filename: string, buffer: ArrayBuffer | Uint8Array): void;

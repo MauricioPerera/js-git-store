@@ -1,10 +1,10 @@
-import { promises as fs } from "node:fs";
 import { resolve } from "node:path";
 import { DEFAULT_HEAVY_REGEX } from "../core/branch-router.js";
 import { GitStoreError } from "../core/types.js";
 import { noopLogger, type Logger } from "../logger.js";
 import { noopMetrics, type MetricsCollector } from "../metrics.js";
 import type { GitStoreConfig } from "./git-store.js";
+export { exists } from "../core/fs-utils.js";
 
 export const DEFAULTS = {
   indexRef: "index",
@@ -87,9 +87,7 @@ export function toBuffer(src: ArrayBuffer | Uint8Array): Buffer {
   return Buffer.from(new Uint8Array(src));
 }
 
-export async function exists(p: string): Promise<boolean> {
-  try { await fs.access(p); return true; } catch { return false; }
-}
+export { assertSafeFilename } from "../core/safe-filename.js";
 
 export function isMissing(err: unknown): boolean {
   if (typeof err !== "object" || err === null) return false;

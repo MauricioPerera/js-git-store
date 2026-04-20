@@ -66,8 +66,9 @@ gcIntervalMs     number              optional, default 0 (off)
 
 ```ts
 // Sync, served from in-memory cache
-readJson<T>(filename): T | null
-readBin(filename):    ArrayBuffer | null
+readJson<T>(filename):       T | null
+readBin(filename):           ArrayBuffer | null   // copy, safe to retain
+readBinShared(filename):     Uint8Array | null    // zero-copy view, see docstring
 writeJson(filename, data):   void
 writeBin(filename, buffer):  void
 delete(filename):            void
@@ -96,7 +97,7 @@ LOCK_TIMEOUT
 CONCURRENT_WRITE
 BACKPRESSURE
 ADAPTER_CLOSED
-INVALID_CONFIG
+INVALID_CONFIG          (also raised on path-traversal in filenames)
 INVALID_INDEX_SCHEMA
 CACHE_CORRUPTED
 NOT_IMPLEMENTED_YET
@@ -112,6 +113,8 @@ gitstore.blob.fetch.ms          histogram  labels: { branch }
 gitstore.commit                 counter    labels: { branch }
 gitstore.cache.evict            counter
 gitstore.queue.wait.ms          histogram
+gitstore.persist                counter
+gitstore.persist.ms             histogram
 gitstore.persist.backpressure   counter
 gitstore.refresh                counter
 gitstore.gc                     counter

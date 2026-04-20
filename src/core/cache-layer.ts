@@ -4,6 +4,8 @@ import type { MetricsCollector } from "../metrics.js";
 export interface CacheEntry {
   variant: "json" | "bin";
   json?: unknown;
+  /** Cached JSON serialization — populated on writeJson to avoid a second stringify on persist. */
+  jsonSerialized?: string;
   bin?: Buffer;
   dirty: boolean;
   deleted: boolean;
@@ -43,9 +45,22 @@ export class CacheLayer {
     return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer;
   }
 
+  /**
+   * Zero-copy view over the cached binary payload. The returned Uint8Array
+   * shares memory with the cache; callers MUST NOT mutate it and MUST NOT
+   * retain the reference past the next persist() / invalidate() / refresh().
+   */
+  readBinShared(filename: string): Uint8Array | null {
+    const e = this.map.get(filename);
+    if (!e || e.deleted || e.variant !== "bin" || !e.bin) return null;
+    this.touch(filename, e);
+    return new Uint8Array(e.bin.buffer, e.bin.byteOffset, e.bin.byteLength);
+  }
+
   writeJson(filename: string, data: unknown): void {
-    const size = Buffer.byteLength(JSON.stringify(data), "utf8");
-    this.set(filename, { variant: "json", json: data, dirty: true, deleted: false, sizeBytes: size });
+    const serialized = JSON.stringify(data);
+    const size = Buffer.byteLength(serialized, "utf8");
+    this.set(filename, { variant: "json", json: data, jsonSerialized: serialized, dirty: true, deleted: false, sizeBytes: size });
   }
 
   writeBin(filename: string, buf: Buffer): void {
