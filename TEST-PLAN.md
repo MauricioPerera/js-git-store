@@ -19,12 +19,24 @@ Concrete test scenarios. Binary pass/fail.
 - [ ] Custom regex overrides the default
 - [ ] `routerFor(regex).branchOf(filename)` returns `"content"` | `"index"` predictably
 
-### `tests/unit/blob-cache.test.ts`
+### `tests/unit/cache-layer.test.ts`
+
+(Replaces the former `blob-cache.test.ts`; the blob-fetch module was inlined into `cache-layer.ts` in v0.6.)
 
 - [ ] Inserting past `maxBytes` evicts least-recently-accessed
 - [ ] `get()` updates access recency; `put()` does too
 - [ ] `invalidate(path)` removes entry and frees bytes
 - [ ] Two concurrent `fetch()`s for the same path share a single in-flight promise
+
+### `tests/unit/safe-filename.test.ts`
+
+- [ ] Rejects path-traversal sequences (`..`, absolute paths, NUL bytes)
+- [ ] Allows the documented filename shapes (`<col>.docs.json`, `<col>.bin`, etc.)
+
+### `tests/unit/metrics.test.ts`
+
+- [ ] `InMemoryMetrics.snapshot()` returns counters/histograms in the documented shape
+- [ ] Noop metrics implementation never throws
 
 ### `tests/unit/commit-queue.test.ts`
 

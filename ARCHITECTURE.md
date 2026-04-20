@@ -9,11 +9,13 @@ src/
 ├── index.ts                         Barrel export (GitStoreAdapter, metrics, types)
 ├── core/
 │   ├── git.ts                       Thin child_process wrapper for git commands
-│   ├── cache-layer.ts               In-memory cache: LRU touch, byte accounting, dirty/tombstone
+│   ├── cache-layer.ts               In-memory cache: LRU touch, byte accounting, dirty/tombstone, blob retrieval
 │   ├── git-layer.ts                 Git orchestration: clones, flock, queue, commit/push/refresh/gc
 │   ├── branch-router.ts             Heavy/light routing by filename regex
 │   ├── commit-queue.ts              InProcessCommitQueue + FileLock primitives
 │   ├── atomic-write.ts              tmp + fsync + rename helper
+│   ├── fs-utils.ts                  Filesystem helpers (safe rm, dir creation)
+│   ├── safe-filename.ts             Filename sanitization / path-traversal guards
 │   └── types.ts                     Shared types + GitStoreError
 ├── adapters/
 │   ├── git-store.ts                 GitStoreAdapter — thin StorageAdapter composition
@@ -24,16 +26,19 @@ src/
 tests/
 ├── unit/                            Pure-function tests (no git invocation)
 │   ├── git-args.test.ts             Verify git command argument construction
-│   ├── index-branch.test.ts         Verify index layout calculations
-│   ├── blob-cache.test.ts           LRU eviction semantics
-│   └── commit-queue.test.ts         Serialization contract
+│   ├── branch-router.test.ts        Heavy/light routing rules
+│   ├── cache-layer.test.ts          LRU eviction + dirty/tombstone semantics
+│   ├── commit-queue.test.ts         Serialization contract
+│   ├── metrics.test.ts              InMemoryMetrics counters/histograms
+│   └── safe-filename.test.ts        Filename sanitization rules
 ├── integration/                     Real git ops against local bare repos
-│   ├── doc-adapter.test.ts          End-to-end against js-doc-store suite
-│   ├── vector-adapter.test.ts       End-to-end against js-vector-store suite
-│   └── concurrency.test.ts          Cross-process flock behavior
+│   ├── git-store.test.ts            End-to-end against js-doc-store suite
+│   ├── vector-store.test.ts         End-to-end against js-vector-store suite
+│   ├── concurrency.test.ts          Cross-process flock behavior
+│   ├── auth-and-cache.test.ts       Auth env propagation + cache eviction
+│   └── v0X-*.test.ts                Per-milestone hardening regression suites
 └── fixtures/
-    ├── make-bare-repo.sh            Spin up a local file:// remote
-    └── sample-corpora/              Small test datasets
+    └── make-bare-repo.ts            Cross-platform helper: spins up a local file:// bare repo
 
 examples/
 ├── skills-catalog/                  Migrate a2e-skills to use the doc adapter
@@ -48,7 +53,7 @@ js-doc-store.find({email: "x@y"})
       ├── check local cache at <cacheDir>/collections/users.docs.jsonl
       │   ├── present + fresh → read from disk, return
       │   └── absent or stale → continue
-      ├── blobFetch.fetch("collections/users.docs.jsonl")
+      ├── cacheLayer.fetch("collections/users.docs.jsonl")
       │   ├── git fetch <contentRef>:collections/users.docs.jsonl
       │   ├── write to cache atomically (tmp + fsync + rename)
       │   └── evict LRU if cache size exceeded
@@ -86,7 +91,7 @@ js-vector-store.similaritySearch("embeddings", queryVec, topK=10, probes=5)
       ├── read centroids.bin (local, from index branch)
       ├── compute topProbes cells against query vector
       ├── for each cell:
-      │     blobFetch.fetch("vectors/embeddings/cell-XXXX.vec.bin")
+      │     cacheLayer.fetch("vectors/embeddings/cell-XXXX.vec.bin")
       ├── score vectors within fetched cells
       └── return top-K
 ```
@@ -135,21 +140,22 @@ export function commitAll(cwd: string, message: string, opts: {...}): Promise<st
 export function push(cwd: string, remote: string, ref: string): Promise<void>;
 ```
 
-### `core/blob-fetch.ts`
+### `core/cache-layer.ts`
+
+Owns both the in-process LRU cache and on-demand blob retrieval (the former `blob-fetch.ts` module was inlined here in v0.6 — see CHANGELOG). Public surface, abbreviated:
 
 ```ts
-interface BlobCache {
-  get(path: string): Promise<Buffer | null>;  // null = cache miss, must fetch
-  put(path: string, data: Buffer): Promise<void>;
-  size(): Promise<number>;  // bytes
-  sweep(targetBytes: number): Promise<number>; // returns bytes freed
-}
-
-interface BlobFetcher {
-  fetch(path: string): Promise<Buffer>;  // try cache, then git fetch, then return
-  invalidate(path: string): Promise<void>;
+class CacheLayer {
+  get(path: string): Buffer | null;          // sync, returns null on miss
+  put(path: string, data: Buffer): void;     // sync, marks dirty if from a write
+  fetch(path: string): Promise<Buffer>;      // async, hydrates from git on miss
+  invalidate(path: string): void;
+  sweep(targetBytes: number): number;        // returns bytes freed
+  size(): number;                             // bytes
 }
 ```
+
+In-flight `fetch()` calls for the same path share a single promise to avoid duplicate git invocations.
 
 ### `core/commit-queue.ts`
 

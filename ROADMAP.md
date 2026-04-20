@@ -11,7 +11,7 @@ Phased delivery. Each phase ends with a usable tag + a decision point.
 ### Scope
 
 - `GitStoreAdapter` implementing the upstream sync + preload/persist contract
-- Core modules: `git.ts`, `branch-router.ts`, `blob-fetch.ts`, `commit-queue.ts`, `atomic-write.ts`
+- Core modules: `git.ts`, `branch-router.ts`, `cache-layer.ts` (originally split as `blob-fetch.ts`, merged in v0.6), `commit-queue.ts`, `atomic-write.ts`
 - Unit tests per TEST-PLAN.md
 - Integration tests using **real** `DocStore(adapter)` and `VectorStore(adapter, dim)` against file:// bare repo fixtures
 - Examples: `examples/skills-catalog/` (DocStore) and `examples/vector-rag/` (VectorStore)

@@ -94,7 +94,7 @@ Conventions to match:
 
 1. `src/core/git.ts` — `spawn("git", …)` wrapper. ≤ 200 lines.
 2. `src/core/branch-router.ts` — routes filenames to index/content branch per `heavyFileRegex`. ≤ 80 lines.
-3. `src/core/blob-fetch.ts` — on-demand blob retrieval + LRU-bounded cache. ≤ 200 lines.
+3. ~~`src/core/blob-fetch.ts`~~ — superseded in v0.6: blob retrieval + LRU cache live inside `src/core/cache-layer.ts`. Kept here for historical traceability only.
 4. `src/core/commit-queue.ts` — serialized writes + flock. ≤ 150 lines.
 5. `src/core/atomic-write.ts` — tmp + fsync + rename. ≤ 50 lines.
 6. `src/adapters/git-store.ts` — `GitStoreAdapter` with sync read/write + async preload/persist/refresh/gc. ≤ 400 lines. (Bumped from 350 as v0.3/v0.4 legitimately grew the surface: metrics wiring, backpressure, refresh, gc, LRU touch.)
