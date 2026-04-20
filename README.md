@@ -70,6 +70,7 @@ Same as above. The artifacts are self-describing.
 
 - [js-doc-store](https://github.com/MauricioPerera/js-doc-store) — host library for documents; adapter target
 - [js-vector-store](https://github.com/MauricioPerera/js-vector-store) — host library for vectors; adapter target
+- [llm-wiki-kit](https://github.com/MauricioPerera/llm-wiki-kit) — LLM-maintained markdown wiki built on top of this adapter. Uses `writeBin` for Obsidian-compatible `.md` pages on the index ref; `.docs.json` + `.bin` for embeddings on the content ref; relies on the default `heavyFileRegex` routing.
 - [a2e-shell](https://github.com/MauricioPerera/a2e-shell) — HTTP server for LLM agents; uses this pattern in its catalog cache
 - [a2e-skills](https://github.com/MauricioPerera/a2e-skills) — knowledge catalog for LLM agents; migration target for v0.1
 
