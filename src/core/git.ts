@@ -6,6 +6,8 @@ export interface AuthCallOpts {
   configs?: Record<string, string>;
   authEnv?: Record<string, string>;
   redactor?: (t: string) => string;
+  /** Hard cap on accumulated stdout+stderr bytes. Aborts the child if exceeded. Default 256 MiB. */
+  maxOutputBytes?: number;
 }
 
 export interface RunGitOptions extends AuthCallOpts {
@@ -17,6 +19,7 @@ export interface RunGitOptions extends AuthCallOpts {
 export interface RunGitResult { stdout: string; stderr: string; exitCode: number; durationMs: number }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_OUTPUT_BYTES = 256 * 1024 * 1024;
 
 export function buildGitEnv(base: NodeJS.ProcessEnv, authEnv?: Record<string, string>, extra?: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...base };
@@ -37,6 +40,7 @@ function withConfigs(args: readonly string[], configs?: Record<string, string>):
 
 function spawnGit(args: readonly string[], opts: RunGitOptions): Promise<RawResult> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const maxOutputBytes = opts.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   const env = buildGitEnv(process.env, opts.authEnv, opts.env);
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
@@ -52,20 +56,39 @@ function spawnGit(args: readonly string[], opts: RunGitOptions): Promise<RawResu
     });
     const outChunks: Buffer[] = [];
     const errChunks: Buffer[] = [];
-    child.stdout.on("data", (c: Buffer) => outChunks.push(c));
-    child.stderr.on("data", (c: Buffer) => errChunks.push(c));
+    let accumulated = 0;
+    let overflowed = false;
+    const onChunk = (chunks: Buffer[], c: Buffer): void => {
+      if (overflowed) return;
+      accumulated += c.byteLength;
+      if (accumulated > maxOutputBytes) {
+        overflowed = true;
+        try { child.kill("SIGKILL"); } catch { /* already gone */ }
+        return;
+      }
+      chunks.push(c);
+    };
+    child.stdout.on("data", (c: Buffer) => onChunk(outChunks, c));
+    child.stderr.on("data", (c: Buffer) => onChunk(errChunks, c));
     if (opts.input !== undefined) child.stdin.end(opts.input);
     else child.stdin.end();
     child.on("error", (err) => {
       clearTimeout(timer);
       if (ac.signal.aborted) {
-        reject(new GitStoreError("GIT_COMMAND_FAILED", `git ${args[0] ?? "?"} timed out after ${timeoutMs}ms`, err));
+        const msg = `git ${args[0] ?? "?"} timed out after ${timeoutMs}ms`;
+        reject(new GitStoreError("GIT_COMMAND_FAILED", opts.redactor ? opts.redactor(msg) : msg, err));
         return;
       }
-      reject(new GitStoreError("GIT_COMMAND_FAILED", String(err), err));
+      const raw = String(err);
+      reject(new GitStoreError("GIT_COMMAND_FAILED", opts.redactor ? opts.redactor(raw) : raw, err));
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      if (overflowed) {
+        const msg = `git ${args[0] ?? "?"} exceeded maxOutputBytes (${maxOutputBytes})`;
+        reject(new GitStoreError("GIT_COMMAND_FAILED", opts.redactor ? opts.redactor(msg) : msg));
+        return;
+      }
       const stderrRaw = Buffer.concat(errChunks).toString("utf8");
       const stderr = opts.redactor ? opts.redactor(stderrRaw) : stderrRaw;
       resolve({
@@ -80,7 +103,10 @@ function spawnGit(args: readonly string[], opts: RunGitOptions): Promise<RawResu
 }
 
 function raiseIfFailed(args: readonly string[], r: RawResult, timeoutMs: number, redactor?: (t: string) => string): void {
-  if (r.timedOut) throw new GitStoreError("GIT_COMMAND_FAILED", `git ${args[0] ?? "?"} timed out after ${timeoutMs}ms`);
+  if (r.timedOut) {
+    const msg = `git ${args[0] ?? "?"} timed out after ${timeoutMs}ms`;
+    throw new GitStoreError("GIT_COMMAND_FAILED", redactor ? redactor(msg) : msg);
+  }
   if (r.exitCode !== 0) {
     const raw = `git ${args.slice(0, 3).join(" ")} exited ${r.exitCode}: ${r.stderr.slice(0, 500).trim()}`;
     throw new GitStoreError("GIT_COMMAND_FAILED", redactor ? redactor(raw) : raw);

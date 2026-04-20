@@ -1,5 +1,6 @@
 import type { Logger } from "../logger.js";
 import type { MetricsCollector } from "../metrics.js";
+import { GitStoreError } from "./types.js";
 
 export interface CacheEntry {
   variant: "json" | "bin";
@@ -59,6 +60,9 @@ export class CacheLayer {
 
   writeJson(filename: string, data: unknown): void {
     const serialized = JSON.stringify(data);
+    if (typeof serialized !== "string") {
+      throw new GitStoreError("INVALID_CONFIG", `writeJson("${filename}"): value is not JSON-serializable (got ${typeof data})`);
+    }
     const size = Buffer.byteLength(serialized, "utf8");
     this.set(filename, { variant: "json", json: data, jsonSerialized: serialized, dirty: true, deleted: false, sizeBytes: size });
   }
@@ -83,7 +87,12 @@ export class CacheLayer {
   /** Populate a cache slot from a newly-fetched blob (loaded, not dirty). */
   loaded(filename: string, buf: Buffer, isJson: boolean): void {
     if (isJson) {
-      const json = JSON.parse(buf.toString("utf8"));
+      let json: unknown;
+      try {
+        json = JSON.parse(buf.toString("utf8"));
+      } catch (err) {
+        throw new GitStoreError("CACHE_CORRUPTED", `failed to parse JSON for "${filename}": ${(err as Error).message}`, err);
+      }
       this.set(filename, { variant: "json", json, dirty: false, deleted: false, sizeBytes: buf.byteLength });
     } else {
       this.set(filename, { variant: "bin", bin: buf, dirty: false, deleted: false, sizeBytes: buf.byteLength });

@@ -97,7 +97,9 @@ export class GitStoreAdapter {
         if (e.deleted) {
           await this.gitLayer.removeStaged(b, f);
         } else if (e.variant === "json") {
-          await this.gitLayer.writeStaged(b, f, e.jsonSerialized ?? JSON.stringify(e.json));
+          const payload = e.jsonSerialized ?? JSON.stringify(e.json ?? null);
+          if (typeof payload !== "string") throw new GitStoreError("INVALID_CONFIG", `persist: dirty json entry "${f}" is not serializable`);
+          await this.gitLayer.writeStaged(b, f, payload);
           const list = writesByBranch.get(b) ?? []; list.push(f); writesByBranch.set(b, list);
         } else if (e.bin) {
           await this.gitLayer.writeStaged(b, f, e.bin);
