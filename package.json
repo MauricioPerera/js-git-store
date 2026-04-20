@@ -1,15 +1,23 @@
 {
   "name": "js-git-store",
-  "version": "0.0.0",
-  "private": true,
-  "description": "Git-backed storage adapters for js-doc-store and js-vector-store — tree-first, blob-on-demand pattern.",
+  "version": "1.0.0",
+  "description": "Git-backed storage adapter for js-doc-store and js-vector-store — tree-first, blob-on-demand. Zero runtime deps.",
   "type": "module",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md",
+    "STABILITY.md",
+    "SECURITY.md"
   ],
   "engines": {
     "node": ">=20"
@@ -17,10 +25,16 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "typecheck:all": "tsc -p tsconfig.test.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:bench": "node tests/bench/cold-read.mjs && node tests/bench/vector-search.mjs",
+    "bench:cold-read": "tsx tests/bench/cold-read.ts",
     "lint": "eslint src tests --ext .ts",
+    "example:skills": "tsx examples/skills-catalog/run.ts",
+    "example:vector": "tsx examples/vector-rag/run.ts",
+    "e2e:github": "tsx tests/scripts/github-e2e.ts",
+    "e2e:github-quick": "tsx tests/scripts/github-e2e-quick.ts",
+    "soak": "tsx tests/scripts/soak.ts",
     "prepack": "npm run build"
   },
   "dependencies": {},
@@ -37,6 +51,9 @@
     "@typescript-eslint/eslint-plugin": "^8.7.0",
     "@typescript-eslint/parser": "^8.7.0",
     "eslint": "^9.11.0",
+    "js-doc-store": "github:MauricioPerera/js-doc-store#master",
+    "js-vector-store": "github:MauricioPerera/js-vector-store#master",
+    "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "vitest": "^2.1.0"
   },
@@ -48,7 +65,22 @@
     "vector-store",
     "doc-store",
     "knowledge-base",
-    "content-addressable"
+    "content-addressable",
+    "rag",
+    "js-doc-store",
+    "js-vector-store"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MauricioPerera/js-git-store.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MauricioPerera/js-git-store/issues"
+  },
+  "homepage": "https://github.com/MauricioPerera/js-git-store#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false
 }

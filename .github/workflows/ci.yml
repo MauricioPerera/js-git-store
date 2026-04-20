@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: install
+        run: npm ci --no-audit --no-fund
+      - name: typecheck (src)
+        run: npx tsc -p tsconfig.json --noEmit
+      - name: typecheck (tests + examples)
+        run: npx tsc -p tsconfig.test.json --noEmit
+      - name: lint
+        run: npx eslint src tests examples --ext .ts
+      - name: test
+        run: npx vitest run
+        env:
+          CI: 'true'
+      - name: example:skills
+        run: npm run example:skills
+      - name: example:vector
+        run: npm run example:vector
+
+  bench:
+    name: bench (Linux, absolute budget)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci --no-audit --no-fund
+      - name: cold-read bench
+        env:
+          BENCH_GATE: '1'
+        run: npm run bench:cold-read

@@ -6,17 +6,19 @@ Detail of the modules, their responsibilities, and how data flows. Read AFTER CO
 
 ```
 src/
-├── index.ts                         Barrel export (GitDocStoreAdapter, GitVectorStoreAdapter, types)
+├── index.ts                         Barrel export (GitStoreAdapter, metrics, types)
 ├── core/
 │   ├── git.ts                       Thin child_process wrapper for git commands
-│   ├── index-branch.ts              Operations on the orphan index branch
-│   ├── blob-fetch.ts                On-demand blob retrieval + LRU cache
-│   ├── commit-queue.ts              Serialized commits with cross-process flock
+│   ├── cache-layer.ts               In-memory cache: LRU touch, byte accounting, dirty/tombstone
+│   ├── git-layer.ts                 Git orchestration: clones, flock, queue, commit/push/refresh/gc
+│   ├── branch-router.ts             Heavy/light routing by filename regex
+│   ├── commit-queue.ts              InProcessCommitQueue + FileLock primitives
 │   ├── atomic-write.ts              tmp + fsync + rename helper
-│   └── types.ts                     Shared types
+│   └── types.ts                     Shared types + GitStoreError
 ├── adapters/
-│   ├── doc.ts                       Implements js-doc-store StorageAdapter
-│   └── vector.ts                    Implements js-vector-store StorageAdapter
+│   ├── git-store.ts                 GitStoreAdapter — thin StorageAdapter composition
+│   └── git-store-internal.ts        resolveConfig, defaultCommitMessage, helpers
+├── metrics.ts                       Injectable metrics (noop + InMemoryMetrics)
 └── logger.ts                        Injectable noop-default logger
 
 tests/

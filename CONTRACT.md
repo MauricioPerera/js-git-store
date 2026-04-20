@@ -4,166 +4,128 @@ Execution contract for a coding agent. The agent MUST read SPECIFICATION.md and 
 
 ## 1. Objective
 
-Build `js-git-store`: two pluggable storage adapters that persist data in a git repository using a "tree-first, blob-on-demand" layout. The adapters implement the `StorageAdapter` interface of `js-doc-store` and `js-vector-store` respectively, so either library can be switched from `FileStorageAdapter` to `GitStorageAdapter` without code changes.
+Build `js-git-store`: **one unified** pluggable storage adapter that persists data in a git repository using a "tree-first, blob-on-demand" layout. The same adapter satisfies both the `StorageAdapter` shape of `js-doc-store` and `js-vector-store`, so either host can be switched from `FileStorageAdapter` to `GitStoreAdapter` without code changes beyond instantiation.
 
-Success: both adapters pass the host libraries' existing test suites plus the integration tests in `tests/integration/` using a local bare repo fixture. Node 20+, zero runtime deps.
+Success: the adapter, when passed to `new DocStore(adapter)` or any vector-store host, makes those hosts work against a git repo instead of the local filesystem. Node 20+, zero runtime deps.
 
-## 2. Inputs and Outputs
+## 2. Upstream pin and interface (verified 2026-04-19)
 
-### Doc adapter
+Verified upstreams (default branch `master`, not `main`):
+
+- [js-doc-store@master](https://github.com/MauricioPerera/js-doc-store/blob/master/js-doc-store.js) — `FileStorageAdapter` at L210, `DocStore(dirOrAdapter)` constructor at L1138
+- [js-vector-store@master](https://github.com/MauricioPerera/js-vector-store/blob/master/js-vector-store.js) — `FileStorageAdapter` at L301 (adds `readBin/writeBin`)
+
+The real adapter surface is **sync read/write + async preload/persist**:
 
 ```ts
-// Constructor
-new GitDocStoreAdapter({
-  repoUrl: string,        // https or ssh
-  indexRef?: string,       // default "index" — orphan branch, metadata + partitions
-  contentRef?: string,     // default "main"  — content branch, full blobs
-  localCacheDir: string,   // where to keep the shallow clone of indexRef + fetched blobs
-  authEnvVar?: string,     // env var holding token (never hardcoded); unset = public
-  autoCommit?: boolean,    // default true — every write creates a commit
-  pushOnWrite?: boolean,   // default false — caller decides when to push
-  regenerateIndexHook?: (changedCollections: string[]) => Promise<void>,
-})
+interface StorageAdapter {
+  // Sync — served from an in-memory cache the adapter maintains.
+  readJson(filename: string): unknown | null;
+  writeJson(filename: string, data: unknown): void;
+  delete(filename: string): void;
 
-// Interface conforming to js-doc-store StorageAdapter
-interface DocAdapter {
-  readCollection(name: string): Promise<Doc[]>;
-  writeCollection(name: string, docs: Doc[]): Promise<void>;
-  readMeta(name: string): Promise<CollectionMeta>;
-  writeMeta(name: string, meta: CollectionMeta): Promise<void>;
-  readIndex(name: string, field: string): Promise<IndexData | null>;
-  writeIndex(name: string, field: string, data: IndexData): Promise<void>;
-  listCollections(): Promise<string[]>;
-  close(): Promise<void>;
+  // Optional, only for vector-store:
+  readBin(filename: string): ArrayBuffer | null;
+  writeBin(filename: string, buffer: ArrayBuffer | Uint8Array): void;
+
+  // Optional, present on remote-backed adapters:
+  preload(filenames: string[]): Promise<void>;  // hydrate cache from remote
+  persist(): Promise<void>;                     // flush dirty cache to remote
 }
 ```
 
-### Vector adapter
+Host libraries pick filenames. Known shapes:
+
+- `<col>.docs.json` — DocStore documents (HEAVY)
+- `<col>.meta.json` — DocStore index definitions
+- `<col>.<field>.idx.json` — DocStore hash index
+- `<col>.<field>.sidx.json` — DocStore sorted index
+- `<col>.bin` / `<col>.q8.bin` / `<col>.b1.bin` — VectorStore vectors (HEAVY)
+- `<col>.json` / `<col>.q8.json` / `<col>.b1.json` — VectorStore manifest / centroids
+
+The adapter must NOT embed knowledge of these names. It MUST expose a `heavyFileRegex` config (default `/\.(bin|docs\.json)$/`) that routes filenames to the heavy-or-light storage branch.
+
+## 3. Adapter configuration
 
 ```ts
-new GitVectorStoreAdapter({
-  repoUrl: string,
-  indexRef?: string,       // default "index" — IVF centroids, cell map, quantized recall vectors
-  contentRef?: string,     // default "main"  — full-precision vectors per IVF cell
-  localCacheDir: string,
-  authEnvVar?: string,
-  autoCommit?: boolean,
-  pushOnWrite?: boolean,
+new GitStoreAdapter({
+  repoUrl: string,               // https, ssh, or file://
+  indexRef?: string,             // default "index" — orphan branch, light files, shallow clone
+  contentRef?: string,           // default "main"  — content branch, heavy files, partial clone
+  localCacheDir: string,         // where clones + cache live
+  authEnvVar?: string,           // env var name holding token (never hardcode)
+  pushOnPersist?: boolean,       // default false
+  heavyFileRegex?: RegExp,       // default /\.(bin|docs\.json)$/
+  logger?: Logger,               // default noop
+  gitTimeoutMs?: number,         // default 30_000
+  lockTimeoutMs?: number,        // default 30_000
+  staleLockMs?: number,          // default 60_000
+  author?: { name: string; email: string },  // commit identity
+  commitMessage?: (changedFiles: string[]) => string,
 })
-
-interface VectorAdapter {
-  readCollection(name: string): Promise<VectorCollectionBundle>;
-  writeCollection(name: string, bundle: VectorCollectionBundle): Promise<void>;
-  readIVFCell(name: string, cellId: number): Promise<CellData>;
-  listCollections(): Promise<string[]>;
-  close(): Promise<void>;
-}
 ```
 
-Exact method signatures MUST be discovered by reading the current `StorageAdapter` definition in the upstream repos (commit pinned in `PATTERNS` section). This contract names the shape; the agent must match upstream exactly.
-
-## 3. Pinned Stack and Dependencies
+## 4. Pinned stack and dependencies
 
 - Runtime: Node.js 20 LTS (Workers support deferred to v0.2)
-- Language: TypeScript 5.6+, strict mode, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`
-- Test: vitest (not jest)
-- Build: `tsc --noEmit` for typecheck, `tsup` or raw `tsc` for dist
-- Runtime deps: **zero** — the project matches the zero-dep philosophy of its hosts
+- Language: TypeScript 5.6+, strict, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`
+- Test: vitest
+- Build: `tsc --noEmit` for typecheck, `tsc` for dist
+- Runtime deps: **zero** — matches the zero-dep philosophy of the hosts
 - DO NOT use: `simple-git`, `nodegit`, `isomorphic-git`, or any git library. Use `node:child_process.spawn("git", ...)` directly
-- DO NOT use: lodash, axios, zod, or any utility dep. Prefer hand-rolled, small, explicit
-- DO NOT use: `fs.promises.writeFile` without atomic-write semantics (tmp + fsync + rename) for on-disk cache writes
+- DO NOT use: lodash, axios, zod, or any utility dep
 
-## 4. Project Patterns
-
-Two upstream reference projects establish the StorageAdapter interface and existing adapter style:
-
-- js-doc-store: `https://github.com/MauricioPerera/js-doc-store` — read `src/adapters/*` for the exact method signatures `GitDocStoreAdapter` must match
-- js-vector-store: `https://github.com/MauricioPerera/js-vector-store` — same, for `GitVectorStoreAdapter`
+## 5. Project patterns
 
 The git-tree + blob-on-demand pattern already exists in production at:
 
-- a2e-skills: `https://github.com/MauricioPerera/a2e-skills` — orphan `index` branch, `main` content, `tools/gen-index.ts` + `tools/push-index.sh` show the write-side flow
-- a2e-shell: `https://github.com/MauricioPerera/a2e-shell` — `src/catalog/cache.ts` shows the read-side (partial clone, blob fetch on demand, flock, LRU sweep)
+- [a2e-skills](https://github.com/MauricioPerera/a2e-skills) — orphan index + main content
+- [a2e-shell/src/catalog/cache.ts](https://github.com/MauricioPerera/a2e-shell) — read-side: partial clone, blob fetch on demand, flock, LRU sweep
 
-The agent MUST read both to understand the pattern. Do not reimplement; extract.
+The [VercelBlobAdapter](https://github.com/MauricioPerera/js-doc-store/blob/master/vercel-blob-adapter.js) and `CloudflareKVAdapter` in the upstream show the **exact sync-cache + async-persist pattern** the git adapter must follow. Read them before coding.
 
 Conventions to match:
 
-- Atomic writes: tmp file + fsync + rename, same as `a2e-shell/src/session/persistence.ts`
-- Flock for cross-process write coordination: `open(path, 'wx')` pattern from `a2e-shell/src/catalog/cache.ts`
-- Error codes: if any error surface is needed, match `a2e-shell/src/errors.ts` — enum-style ErrorCode, explicit httpStatus fallback
+- Atomic writes: tmp + fsync + rename
+- Flock for cross-process coordination: `open(path, 'wx')`
+- Redactor applied to stderr AND argv-in-error-messages
 
-## 5. Artifacts to Produce
+## 6. Artifacts to produce
 
-1. `src/core/git.ts`
-   - Thin wrapper over `child_process.spawn("git", ...)` with timeout, stderr capture, auth env inheritance
-   - Max 200 lines
-   - Exports: `runGit(args, opts)`, `cloneShallow(...)`, `fetchBlob(...)`, `commit(...)`, `push(...)`
+1. `src/core/git.ts` — `spawn("git", …)` wrapper. ≤ 200 lines.
+2. `src/core/branch-router.ts` — routes filenames to index/content branch per `heavyFileRegex`. ≤ 80 lines.
+3. `src/core/blob-fetch.ts` — on-demand blob retrieval + LRU-bounded cache. ≤ 200 lines.
+4. `src/core/commit-queue.ts` — serialized writes + flock. ≤ 150 lines.
+5. `src/core/atomic-write.ts` — tmp + fsync + rename. ≤ 50 lines.
+6. `src/adapters/git-store.ts` — `GitStoreAdapter` with sync read/write + async preload/persist/refresh/gc. ≤ 400 lines. (Bumped from 350 as v0.3/v0.4 legitimately grew the surface: metrics wiring, backpressure, refresh, gc, LRU touch.)
+7. `src/index.ts` — barrel. ≤ 30 lines.
+8. `tests/unit/**/*.test.ts` — pure-function tests.
+9. `tests/integration/git-store.test.ts` — end-to-end: instantiate a real `DocStore(adapter)` against a file:// bare repo fixture; run real DocStore operations.
+10. `tests/integration/vector-store.test.ts` — same with `readBin/writeBin`.
+11. `tests/integration/concurrency.test.ts` — cross-process flock.
+12. `examples/skills-catalog/run.ts` — real `DocStore` usage on a git-backed catalog.
+13. `examples/vector-rag/run.ts` — real `VectorStore` usage on a git-backed index.
 
-2. `src/core/index-branch.ts`
-   - Manages the orphan `index` branch layout (manifest.json + per-collection meta/index files)
-   - Max 250 lines
-   - Writes delegate to `regenerateIndexHook` if supplied; otherwise uses an inline regenerator
-
-3. `src/core/blob-fetch.ts`
-   - On-demand blob retrieval with LRU-bounded local cache
-   - Max 200 lines
-   - Uses atomic writes to cache dir
-
-4. `src/core/commit-queue.ts`
-   - Serializes writes so concurrent `insert()` calls don't race commits
-   - Max 150 lines
-
-5. `src/adapters/doc.ts`
-   - `GitDocStoreAdapter` implementing js-doc-store interface
-   - Max 300 lines
-   - Delegates to `core/*`; no git logic inline
-
-6. `src/adapters/vector.ts`
-   - `GitVectorStoreAdapter` implementing js-vector-store interface
-   - Max 350 lines
-   - IVF cell → directory mapping handled here
-
-7. `src/index.ts`
-   - Barrel export. Max 30 lines.
-
-8. `tests/unit/**/*.test.ts`
-   - Pure-function tests for core (git arg building, index layout calc, LRU eviction)
-
-9. `tests/integration/doc-adapter.test.ts`
-   - Spin up a local bare git repo, point the adapter at it, run the full js-doc-store test suite against it
-
-10. `tests/integration/vector-adapter.test.ts`
-    - Same, against js-vector-store's test suite
-
-11. `examples/skills-catalog/README.md` + runnable script
-    - Migrate a2e-skills from static-CI-index to js-git-store. Shows the doc adapter in practice.
-
-12. `examples/vector-rag/README.md` + runnable script
-    - Vector RAG over a git-backed knowledge base. Shows the vector adapter in practice.
-
-## 6. Acceptance Criteria
+## 7. Acceptance criteria
 
 - [ ] `npm test` passes with 100% tests green
 - [ ] `npm run typecheck` passes with no errors
 - [ ] `npm run lint` passes with no warnings
-- [ ] Zero runtime dependencies in `dependencies` (devDependencies OK)
-- [ ] Both adapters pass the upstream test suite of their host library when substituted for `FileStorageAdapter`
-- [ ] Cold-read latency for a random blob in a 1,000-doc collection < 100 ms on a local-file remote (`file:///...`)
-- [ ] No file exceeds the line limit from section 5
+- [ ] Zero runtime dependencies in `dependencies`
+- [ ] `npm run example:skills` runs end-to-end, produces a real commit on the fixture bare repo, and a re-read returns the inserted data
+- [ ] Cold-read of a random heavy blob in a 1,000-doc collection < 500 ms on a file:// remote; warm-read < 50 ms
+- [ ] No file exceeds the line limit from section 6
 - [ ] No `any` in TypeScript source. `unknown` + narrowing is acceptable
-- [ ] No console.log. Use an injectable logger if needed (default: noop)
-- [ ] `examples/` scripts run end-to-end and leave no stale state
+- [ ] No `console.log`. Use an injectable logger if needed (default: noop)
 
-## 7. Hard Constraints
+## 8. Hard constraints
 
 - DO NOT add any git library (`isomorphic-git`, `simple-git`, `nodegit`). Only `node:child_process.spawn("git", ...)`.
-- DO NOT touch files outside `src/`, `tests/`, `examples/`, `package.json`, `tsconfig.json`.
-- DO NOT vendor copies of js-doc-store or js-vector-store. Reference them as peer dependencies in tests.
-- DO NOT implement CF Workers support in v0.1. It requires an entirely different transport (GitHub API) and is explicitly deferred. Reject any temptation to add a "workers adapter" variant now.
+- DO NOT touch files outside `src/`, `tests/`, `examples/`, `package.json`, `tsconfig*.json`, `vitest.config.ts`, `eslint.config.js`, `.github/workflows/*.yml`.
+- DO NOT vendor copies of js-doc-store or js-vector-store. Reference them as peer dependencies in tests (or pin to the upstream git URL for integration).
+- DO NOT implement CF Workers support in v0.1. Deferred to v2.0.
 - DO NOT write explanatory comments inside code beyond JSDoc on exported symbols.
-- DO NOT generate README or CHANGELOG files beyond the single root README.md and what this contract explicitly lists.
-- DO NOT commit. Leave changes in the working directory for the human to review.
-- DO NOT publish to npm. Leave `private: true` in package.json.
-- If a criterion from section 6 cannot be met, STOP and report the block. Do not implement silent workarounds (e.g., removing a failing test "because it was flaky").
-- If the upstream StorageAdapter interface has changed since this contract was written and the new shape is incompatible, STOP and report. Do not guess.
+- DO NOT commit. Leave changes in the working directory.
+- Pre-v1.0: DO NOT publish to npm. From v1.0 onward, publication is expected (see STABILITY.md); `private: true` was removed for the v1.0 release.
+- If a criterion from section 7 cannot be met, STOP and report. No silent workarounds.
+- If upstream interfaces change in an incompatible way, STOP and report. Do not guess.

@@ -6,146 +6,280 @@ Public surface. Read ARCHITECTURE.md for internals.
 
 ```ts
 import {
-  GitDocStoreAdapter,
-  GitVectorStoreAdapter,
+  GitStoreAdapter,
   GitStoreError,
+  noopLogger,
   type GitStoreConfig,
   type Logger,
+  type ErrorCode,
 } from "js-git-store";
 ```
 
-## GitDocStoreAdapter
+## GitStoreAdapter
 
-Intended to be passed to `new DocStore({ adapter: ... })` (js-doc-store constructor signature — check the upstream README for exact shape).
+Unified adapter. Same instance works with `js-doc-store` and `js-vector-store`:
+
+```ts
+import { DocStore } from "js-doc-store";
+import { GitStoreAdapter } from "js-git-store";
+
+const adapter = new GitStoreAdapter({
+  repoUrl: "https://github.com/me/my-kb.git",
+  localCacheDir: "./.cache/kb",
+  authEnvVar: "GITHUB_TOKEN",
+});
+
+const db = new DocStore(adapter);   // positional, matches upstream
+```
 
 ### Constructor
 
 ```ts
-new GitDocStoreAdapter(config: GitDocStoreConfig)
+new GitStoreAdapter(config: GitStoreConfig)
 
-interface GitDocStoreConfig {
-  /** Git URL — https, ssh, or file:// */
+interface GitStoreConfig {
+  /** Git URL — https, ssh, or file://. Required. */
   repoUrl: string;
 
-  /** Orphan branch for metadata + indices. Default "index". */
+  /** Local cache directory. Worktrees + content blob cache live here. Required. */
+  localCacheDir: string;
+
+  /** Orphan light-files branch. Shallow clone, always local. Default "index". */
   indexRef?: string;
 
-  /** Content branch for full documents. Default "main". */
+  /** Heavy-files branch. Partial clone (--filter=blob:none), fetched on demand. Default "main". */
   contentRef?: string;
 
   /**
-   * Local cache directory. Worktree for indexRef lives here; content blobs
-   * are fetched into a subdirectory on demand.
+   * Routes a filename to the heavy branch if it matches, to the index branch otherwise.
+   * Default matches js-doc-store + js-vector-store heavy blobs:
+   *   /\.(bin|docs\.json)$/
    */
-  localCacheDir: string;
+  heavyFileRegex?: RegExp;
 
   /**
-   * Name of the env var holding the auth token. Adapter reads process.env[name]
-   * at construction time AND before each git call (for rotation). Do NOT pass
-   * the literal token here.
+   * Env var name holding the auth token. The adapter reads process.env[name] at each
+   * git call (for rotation). Token is never logged, never stored on disk, and is
+   * redacted from error messages.
    */
   authEnvVar?: string;
 
-  /** Default true. When false, caller must call flush() explicitly. */
-  autoCommit?: boolean;
+  /** Auto-push on every persist(). Default false — most callers push explicitly. */
+  pushOnPersist?: boolean;
 
-  /** Default false. Auto-push is usually wrong; leave the caller in control. */
-  pushOnWrite?: boolean;
-
-  /**
-   * Called with a list of mutated collection names after each commit.
-   * Use it to regenerate indices (index branch files) programmatically.
-   * Default: noop (indices NOT auto-regenerated — consider this before relying on indexed queries).
-   */
-  regenerateIndexHook?: (changedCollections: string[]) => Promise<void>;
-
-  /**
-   * Cap for the content blob cache. Oldest-accessed blobs evicted past this.
-   * Default 500 MiB.
-   */
-  maxCacheBytes?: number;
-
-  /** Injectable logger. Default: noop. */
+  /** Injectable logger. Default: noopLogger. */
   logger?: Logger;
 
-  /**
-   * Timeout for any single git command. Default 30_000 (30 s).
-   */
+  /** Timeout for any single git command. Default 30_000. */
   gitTimeoutMs?: number;
-}
-```
 
-### Methods (implements js-doc-store StorageAdapter)
+  /** Cross-process lock acquisition timeout. Default 30_000. */
+  lockTimeoutMs?: number;
 
-Exact method list MUST match the StorageAdapter interface in the upstream js-doc-store. The agent building this project reads the current upstream interface and matches it. Expected surface (subject to upstream changes):
+  /** Lock older than this is considered stale and reclaimable. Default 60_000. */
+  staleLockMs?: number;
 
-```ts
-class GitDocStoreAdapter implements DocStoreAdapter {
-  readCollection(name: string): Promise<Doc[]>;
-  writeCollection(name: string, docs: Doc[]): Promise<void>;
-  readMeta(name: string): Promise<CollectionMeta | null>;
-  writeMeta(name: string, meta: CollectionMeta): Promise<void>;
-  readIndex(name: string, field: string): Promise<IndexData | null>;
-  writeIndex(name: string, field: string, data: IndexData): Promise<void>;
-  listCollections(): Promise<string[]>;
+  /** Identity used for commits the adapter creates. */
+  author?: { name: string; email: string };
 
-  /** Drain in-flight commits. Call before process exit. */
-  flush(): Promise<void>;
+  /** Commit message builder. Default: `js-git-store: persist N file(s)`. */
+  commitMessage?: (changedFiles: string[]) => string;
 
-  /** Push the current HEAD of contentRef to the remote. Only works when configured. */
-  push(): Promise<void>;
+  /** Cap for the in-memory blob cache. LRU eviction of clean entries past this. Default 500 MiB. */
+  maxCacheBytes?: number;
 
-  /** Stop any background timers and release locks. */
-  close(): Promise<void>;
-}
-```
-
-## GitVectorStoreAdapter
-
-Intended to be passed to `new VectorStore({ adapter: ... })` (js-vector-store constructor signature).
-
-### Constructor
-
-```ts
-new GitVectorStoreAdapter(config: GitVectorStoreConfig)
-
-interface GitVectorStoreConfig extends GitDocStoreConfig {
-  /**
-   * Reranking policy when reading.
-   * - "none":              score only fetched cell blobs
-   * - "quantized-recall":  use 1-bit quantized recall from index branch + re-rank
-   */
-  rerankMode?: "none" | "quantized-recall";
+  /** Clone depth for the index branch. `0` or negative = full history. Default `1` (shallow). */
+  indexDepth?: number;
 
   /**
-   * Default probes for similarity searches. Caller can override per-query.
-   * Default 5.
+   * If > 0, run `git gc --auto` on both worktrees every N ms in the background.
+   * Cleared on close(). Default 0 (off). Caller can still invoke `gc()` manually.
    */
-  defaultProbes?: number;
+  gcIntervalMs?: number;
 }
 ```
 
-### Methods
+### Methods — sync (served from in-memory cache)
+
+The sync surface matches the upstream `FileStorageAdapter` interface exactly.
 
 ```ts
-class GitVectorStoreAdapter implements VectorStoreAdapter {
-  readCollection(name: string): Promise<VectorCollectionBundle>;
-  writeCollection(name: string, bundle: VectorCollectionBundle): Promise<void>;
-  readIVFCell(name: string, cellId: number): Promise<CellData>;
-  listCollections(): Promise<string[]>;
-  flush(): Promise<void>;
-  push(): Promise<void>;
-  close(): Promise<void>;
+class GitStoreAdapter {
+  /** Returns parsed JSON from cache, or null if not preloaded / not written yet. */
+  readJson<T = unknown>(filename: string): T | null;
+
+  /** Stages JSON in cache as dirty. Does NOT touch git until persist() is called. */
+  writeJson(filename: string, data: unknown): void;
+
+  /** Returns the raw blob from cache, or null if not preloaded. */
+  readBin(filename: string): ArrayBuffer | null;
+
+  /** Stages a binary payload in cache as dirty. */
+  writeBin(filename: string, buffer: ArrayBuffer | Uint8Array): void;
+
+  /** Marks the file for deletion on next persist(). */
+  delete(filename: string): void;
 }
 ```
+
+Rules:
+
+- `readJson`/`readBin` return `null` for files that were never written and were not in the preload list. This matches the upstream contract.
+- `writeJson`/`writeBin` are fire-and-forget into cache; durability is reached only via `persist()`.
+- Cache entries written in this process are visible to subsequent reads in the same process immediately.
+
+### Methods — async (git I/O)
+
+```ts
+class GitStoreAdapter {
+  /**
+   * Clone both refs locally on first call, then hydrate the in-memory cache with the
+   * listed filenames. Heavy files are fetched from the content branch (partial clone
+   * triggers a git fetch per blob on access); light files are read from the shallow
+   * index worktree.
+   *
+   * Calling with filenames that don't exist in the repo is allowed — those reads
+   * later return null.
+   */
+  preload(filenames: string[]): Promise<void>;
+
+  /**
+   * Write all dirty cache entries to their target worktree, stage, commit per branch,
+   * and (if pushOnPersist) push. Deletions are applied as git rm.
+   *
+   * Safe to call with no dirty entries — becomes a no-op.
+   * Serialized in-process; cross-process via a file lock under localCacheDir.
+   */
+  persist(): Promise<void>;
+
+  /** Push current HEAD of both branches to origin. No-op if already up to date. */
+  push(): Promise<void>;
+
+  /**
+   * Pull latest refs from origin and drop all clean cache entries so subsequent
+   * reads see the new state. Dirty entries are preserved.
+   *
+   * Throws `CONCURRENT_WRITE` if local un-pushed commits exist on either
+   * branch (calling `refresh()` would discard them). Pass `{ force: true }` to
+   * override and accept the discard.
+   *
+   * Serialized via commit queue + flock.
+   */
+  refresh(opts?: { force?: boolean }): Promise<void>;
+
+  /**
+   * Run `git gc --auto --quiet` on both worktrees to repack loose objects and
+   * reclaim disk. Serialized via queue + flock. Safe on a live repo.
+   */
+  gc(): Promise<void>;
+
+  /** Drain pending work and release locks. Call before process exit. */
+  close(): Promise<void>;
+
+  /** `await using` support — equivalent to `await close()`. Needs Node 20+ / TS 5.2+. */
+  [Symbol.asyncDispose](): Promise<void>;
+}
+```
+
+### `await using` pattern
+
+```ts
+{
+  await using adapter = new GitStoreAdapter({ ... });
+  await adapter.preload([...]);
+  // ... work ...
+}  // adapter.close() is called automatically here, even on thrown errors
+```
+
+### Methods — cache management (sync)
+
+```ts
+class GitStoreAdapter {
+  /**
+   * Drop a single clean entry from the in-memory cache. Returns false if the entry
+   * is missing or still dirty (dirty entries are never evicted — you'd lose writes).
+   * A later preload() of the same filename re-fetches from git.
+   */
+  invalidate(filename: string): boolean;
+
+  /** Current cached bytes (sum of payload sizes across all entries). */
+  cacheBytes(): number;
+
+  /** Number of entries currently in the in-memory cache (including tombstones). */
+  cacheEntryCount(): number;
+}
+```
+
+Automatic eviction: when `preload()` loads a new file that pushes total bytes past `maxCacheBytes`, the oldest CLEAN entries are dropped in insertion order. Dirty entries always stay resident until `persist()` runs.
+
+## Authentication — HTTPS
+
+When `authEnvVar` is configured, every git invocation gets:
+
+- `GIT_TERMINAL_PROMPT=0` — no interactive prompts
+- An injected `Authorization: Bearer <token>` header via `-c http.extraHeader=...`
+- Stderr redaction replacing the token with `***`
+
+For GitHub, a fine-grained PAT or a GitHub App installation token in `GITHUB_TOKEN` is the expected setup:
+
+```ts
+const adapter = new GitStoreAdapter({
+  repoUrl: "https://github.com/me/private-kb.git",
+  authEnvVar: "GITHUB_TOKEN",
+  localCacheDir: "./.cache",
+});
+```
+
+The token is never written to disk, never logged, and redacted from any error surfaced to the caller.
+
+## Authentication — SSH
+
+No special configuration. The adapter inherits your system's `ssh` / `~/.ssh/config`. Point `repoUrl` at `git@github.com:me/repo.git` and git does the rest.
+
+## Metrics + structured logging (v0.3)
+
+Inject a `MetricsCollector` to observe adapter internals without parsing logs. Default is noop. Use `InMemoryMetrics` for tests or scrape targets.
+
+```ts
+import { GitStoreAdapter, InMemoryMetrics } from "js-git-store";
+
+const metrics = new InMemoryMetrics();
+const adapter = new GitStoreAdapter({ ..., metrics });
+
+await adapter.preload(["users.docs.json", "users.meta.json"]);
+metrics.snapshot();
+// [
+//   { name: "gitstore.blob.fetch", kind: "counter", value: 2, labels: { branch: "...", result: "ok" } },
+//   { name: "gitstore.blob.fetch.ms", kind: "histogram", value: 12, count: 2, ... },
+// ]
+```
+
+Emitted metrics:
+
+| Name | Kind | Labels | When |
+|---|---|---|---|
+| `gitstore.blob.fetch` | counter | `branch`, `result: ok \| miss \| error` | Every preload attempt |
+| `gitstore.blob.fetch.ms` | histogram | `branch` | On successful fetch |
+| `gitstore.commit` | counter | `branch` | On every commit created by persist() |
+| `gitstore.cache.evict` | counter | — | On every cache entry evicted past `maxCacheBytes` |
+| `gitstore.queue.wait.ms` | histogram | — | Time each write spent in the commit queue |
+| `gitstore.persist.backpressure` | counter | — | Every rejected `persist()` call |
+| `gitstore.refresh` | counter | — | Every completed `refresh()` call |
+| `gitstore.gc` | counter | — | Every completed `gc()` call |
+| `gitstore.gc.ms` | histogram | — | `gc()` duration |
+
+Structured events via `logger`: `blob.fetch.hit`, `blob.fetch.miss`, `blob.cache.evict`, `commit.created`, `commit.queue.wait`, `close.drain.error`, `delete.index.skip`.
+
+## Backpressure
+
+Set `maxPendingWrites > 0` to cap the in-flight commit queue. `persist()` rejects with `BACKPRESSURE` when the queue is full. Callers typically retry after a short delay or reduce write concurrency.
 
 ## Error class
 
 ```ts
 class GitStoreError extends Error {
   readonly code: ErrorCode;
-  readonly cause?: unknown;  // underlying error if wrapped
-
+  readonly cause?: unknown;
   constructor(code: ErrorCode, message: string, cause?: unknown);
 }
 
@@ -156,11 +290,15 @@ type ErrorCode =
   | "BRANCH_NOT_FOUND"
   | "LOCK_TIMEOUT"
   | "CONCURRENT_WRITE"
+  | "BACKPRESSURE"
+  | "ADAPTER_CLOSED"
+  | "INVALID_CONFIG"
   | "INVALID_INDEX_SCHEMA"
-  | "CACHE_CORRUPTED";
+  | "CACHE_CORRUPTED"
+  | "NOT_IMPLEMENTED_YET";
 ```
 
-## Logger interface
+## Logger
 
 ```ts
 interface Logger {
@@ -171,75 +309,68 @@ interface Logger {
 }
 ```
 
-Default (exported constant): `noopLogger`. Plug pino, console, or custom.
-
 ## Usage examples
 
-### Doc adapter — knowledge base
+### Doc store — versioned knowledge base
 
 ```ts
 import { DocStore } from "js-doc-store";
-import { GitDocStoreAdapter } from "js-git-store";
+import { GitStoreAdapter } from "js-git-store";
 
-const adapter = new GitDocStoreAdapter({
-  repoUrl: "https://github.com/me/my-knowledge-base.git",
-  authEnvVar: "GITHUB_TOKEN",
+const adapter = new GitStoreAdapter({
+  repoUrl: "https://github.com/me/my-kb.git",
   localCacheDir: "./.cache/kb",
-  autoCommit: true,
-  pushOnWrite: false,
+  authEnvVar: "GITHUB_TOKEN",
 });
 
-const db = new DocStore({ adapter });
+const db = new DocStore(adapter);
 
-await db.collection("articles").insert({ title: "Hello", body: "..." });
-await db.collection("articles").insert({ title: "World", body: "..." });
+// Hydrate the files the next operations will touch.
+await adapter.preload(["articles.docs.json", "articles.meta.json"]);
 
-// All writes above are committed to local HEAD. Nothing pushed yet.
-await adapter.flush();  // safe to exit process
+const articles = db.collection("articles");
+articles.createIndex("slug", { unique: true });
+articles.insert({ slug: "hello-world", title: "Hello", body: "..." });
 
-// Later, when ready:
-await adapter.push();   // now the remote has them
+// Persist to git (commits; doesn't push yet).
+db.flush();             // flushes the host-level cache
+await adapter.persist(); // commits changed files
+await adapter.push();    // publish when ready
 ```
 
-### Vector adapter — versioned RAG
+### Vector store — git-backed RAG
 
 ```ts
 import { VectorStore } from "js-vector-store";
-import { GitVectorStoreAdapter } from "js-git-store";
+import { GitStoreAdapter } from "js-git-store";
 
-const adapter = new GitVectorStoreAdapter({
+const adapter = new GitStoreAdapter({
   repoUrl: "https://github.com/me/rag-index.git",
-  contentRef: "embeddings-v2",  // experiment branch with new model
+  contentRef: "embeddings-v2",
   localCacheDir: "./.cache/rag",
-  rerankMode: "quantized-recall",
-  defaultProbes: 5,
   authEnvVar: "GITHUB_TOKEN",
 });
 
-const vectors = new VectorStore({ adapter });
+await adapter.preload(["articles.bin", "articles.json"]);
 
-const results = await vectors
-  .collection("articles")
-  .similaritySearch(queryEmbedding, { topK: 10 });
-
-// queryEmbedding is Float32Array[768]; results hydrated from ~5 IVF cells
-// total blobs fetched: < 10 MB for a 1M-vector corpus
+const store = new VectorStore(adapter, 768);
+const hits = store.search("articles", queryEmbedding, 10);
 ```
 
-### Pinning to a specific commit for reproducibility
+### Pinning to a commit for reproducibility
 
 ```ts
-const adapter = new GitDocStoreAdapter({
+const adapter = new GitStoreAdapter({
   repoUrl: "...",
-  contentRef: "3d654f6",  // specific commit SHA, not a branch
+  contentRef: "3d654f6",
   localCacheDir: "...",
 });
-
-// This DB is frozen as of 3d654f6. Perfect for reproducible RAG or audit.
 ```
 
-## Compatibility notes
+Both refs can be branches, tags, or full SHAs.
 
-- The adapter implements whatever StorageAdapter surface js-doc-store and js-vector-store expose at the pinned version (see CONTRACT.md section 4 for pins).
-- If upstream adds methods, the adapter returns `Promise.reject(new GitStoreError("NOT_IMPLEMENTED_YET", ...))` — never silently noop.
-- Node 20+ only. Node 18 and below lack the async disposable patterns the cleanup relies on.
+## Compatibility
+
+- The adapter matches the real `FileStorageAdapter` shape as of the upstream repos' `master` branch on 2026-04-19. If upstream changes, pin or fork.
+- Node 20+ only.
+- Windows: works via native git (partial clone requires git 2.22+). File paths are normalized internally.

@@ -1,16 +1,16 @@
 # js-git-store
 
-Git-backed storage adapters for [js-doc-store](https://github.com/MauricioPerera/js-doc-store) and [js-vector-store](https://github.com/MauricioPerera/js-vector-store). Use a git repository as your versioned, content-addressable, edge-deployable database substrate.
+One unified git-backed storage adapter for [js-doc-store](https://github.com/MauricioPerera/js-doc-store) and [js-vector-store](https://github.com/MauricioPerera/js-vector-store). Use a git repository as your versioned, content-addressable, edge-deployable database substrate.
 
 Zero runtime dependencies. Node 20+. TypeScript strict.
 
 ## Status
 
-**Pre-v0.1.** The artifacts in this repo are the execution contract for a coding agent to build the implementation. No code has been written yet. Read the contracts below, in order, and use them to drive the build.
+**v1.0 — stable.** Public API is frozen per [STABILITY.md](STABILITY.md); threat model in [SECURITY.md](SECURITY.md). Changelog in [CHANGELOG.md](CHANGELOG.md).
 
 ## What it is
 
-Two pluggable `StorageAdapter` implementations that persist `js-doc-store` collections and `js-vector-store` vectors in a git repo using a "tree first, blob on demand" layout:
+A single pluggable `StorageAdapter` that persists `js-doc-store` collections and `js-vector-store` vectors in a git repo using a "tree first, blob on demand" layout:
 
 - One orphan `index` branch — small, cloned shallow, always local — holds metadata + partitions
 - One `main` content branch — large, cloned with `--filter=blob:none` — holds full documents and vectors, fetched on demand

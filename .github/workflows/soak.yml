@@ -1,0 +1,29 @@
+name: soak
+
+on:
+  workflow_dispatch:
+    inputs:
+      soak_seconds:
+        description: 'Soak duration in seconds'
+        required: false
+        default: '600'
+  schedule:
+    # Weekly, Sundays at 02:00 UTC
+    - cron: '0 2 * * 0'
+
+jobs:
+  soak:
+    name: soak (${{ github.event.inputs.soak_seconds || '3600' }}s)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - run: npm ci --no-audit --no-fund
+      - name: soak run
+        env:
+          SOAK_SECONDS: ${{ github.event.inputs.soak_seconds || '3600' }}
+        run: npm run soak

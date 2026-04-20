@@ -1,128 +1,104 @@
 # TEST-PLAN — js-git-store
 
-Concrete test scenarios. Binary pass/fail. No aspirational "TODO tests".
+Concrete test scenarios. Binary pass/fail.
 
 ## Unit tests (no git invocation)
 
 ### `tests/unit/git-args.test.ts`
 
-Exercises the git command argument construction without running git.
-
 - [ ] `runGit(["clone", url, dir], {cwd})` produces `argv = ["clone", url, dir]` with no shell interpretation
-- [ ] Timeout option results in `AbortSignal` passed to `spawn`
-- [ ] `authEnv` values are merged into env **for that call only** and do not leak into `process.env`
-- [ ] `redactor` is invoked on stderr before it's included in thrown errors — tokens scrubbed
-- [ ] Non-zero exit code produces `GitStoreError({code: "GIT_COMMAND_FAILED"})` with exit code + stderr preview
+- [ ] `authEnv` values are merged for that call only and do NOT leak into `process.env`
+- [ ] Non-zero exit code produces `GitStoreError({code: "GIT_COMMAND_FAILED"})`
+- [ ] `redactor` scrubs the token from stderr AND from the argv section of the error message
+- [ ] Timeout produces a `GIT_COMMAND_FAILED` with "timed out" in the message
 
-### `tests/unit/index-branch.test.ts`
+### `tests/unit/branch-router.test.ts`
 
-Path computation and manifest shape.
-
-- [ ] `collectionMetaPath("users")` === `"collections/users.meta.json"`
-- [ ] `collectionDocsPath("users")` === `"collections/users.docs.jsonl"`
-- [ ] `indexPath("users", "email")` === `"collections/users.idx.email.json"`
-- [ ] `vectorCellPath("embeddings", 37)` === `"vectors/embeddings/cell-0037.vec.bin"` — zero-padded 4 digits
-- [ ] `parseManifest(valid)` returns the manifest; invalid throws `INVALID_INDEX_SCHEMA`
-- [ ] `buildManifest([cols], [vecCols])` produces JSON matching the documented schema
+- [ ] Default `heavyFileRegex` matches `users.docs.json`, `articles.bin`, `index.q8.bin`
+- [ ] Default regex does NOT match `users.meta.json`, `articles.idx.json`, `index.json`
+- [ ] Custom regex overrides the default
+- [ ] `routerFor(regex).branchOf(filename)` returns `"content"` | `"index"` predictably
 
 ### `tests/unit/blob-cache.test.ts`
 
-LRU semantics without filesystem.
-
 - [ ] Inserting past `maxBytes` evicts least-recently-accessed
-- [ ] `get()` updates access time, `put()` also updates
+- [ ] `get()` updates access recency; `put()` does too
 - [ ] `invalidate(path)` removes entry and frees bytes
-- [ ] `size()` is accurate after inserts + evictions
-- [ ] Two concurrent `get()` for the same path share a single fetch (in-flight coalescing)
+- [ ] Two concurrent `fetch()`s for the same path share a single in-flight promise
 
 ### `tests/unit/commit-queue.test.ts`
 
-Serialization.
-
-- [ ] Two enqueued tasks run in FIFO order even when the second is submitted before the first awaits
-- [ ] Task errors propagate to the caller but don't block subsequent tasks
+- [ ] Two enqueued tasks run FIFO even when the second is submitted before the first awaits
+- [ ] Task errors propagate but don't block subsequent tasks
 - [ ] `drain()` resolves only after all tasks complete
-- [ ] `size()` returns pending + running count
+- [ ] `FileLock.acquire` times out with `LOCK_TIMEOUT` when another holder blocks
+- [ ] Stale lock older than `staleMs` is stolen
 
-## Integration tests (real git, local file:// remote)
+## Integration tests (real git, file:// remote)
 
-### Setup — `tests/fixtures/make-bare-repo.sh`
+### Setup — `tests/fixtures/make-bare-repo.ts`
 
-Creates a temporary bare repo with:
-- `main` branch: sample collections + some vector cells
-- `index` branch: matching manifest + index files
-- Configurable corpus size via env vars
+Cross-platform (TypeScript). Creates a temp bare repo with:
 
-All integration tests use this via `file:///path/to/bare.git` to avoid network dependencies.
+- `main` branch: seeded with `<col>.docs.json` for two collections
+- `index` branch: seeded with `<col>.meta.json` for the same collections
+- `uploadpack.allowFilter=true` on the bare repo so partial clone works against `file://`
 
-### `tests/integration/doc-adapter.test.ts`
+All integration tests consume this helper.
+
+### `tests/integration/git-store.test.ts`
+
+Targets `DocStore(adapter)` from js-doc-store, run against a fixture bare repo.
 
 Happy path:
 
-- [ ] Fresh clone: `GitDocStoreAdapter` constructed with a file:// URL clones indexRef and is ready to read
-- [ ] `readCollection("users")` fetches the docs blob on first call, serves from cache on second
-- [ ] `writeCollection("users", [...newDocs])` creates a commit on `contentRef` locally
-- [ ] `writeCollection` with `regenerateIndexHook` updates index branch files in the same commit
-- [ ] `listCollections()` reads from the manifest
-- [ ] `flush()` waits for the commit queue to drain
+- [ ] Fresh `GitStoreAdapter` → `preload([...])` succeeds and caches the listed files
+- [ ] `db.collection("users").find({...}).toArray()` returns the seeded docs
+- [ ] `insert()` + `db.flush()` + `adapter.persist()` creates commits on BOTH branches when warranted
+- [ ] Re-reading the same repo in a second adapter instance sees the committed inserts
+- [ ] `createIndex("email")` causes the index file to persist to the index branch (light)
+- [ ] Docs JSON persists to the content branch (heavy)
+- [ ] `listCollections()` via `db.collections()` reflects the host's in-memory state
 
 Error handling:
 
-- [ ] Non-existent `indexRef` → `BRANCH_NOT_FOUND` on construction (eagerly validated)
-- [ ] Missing auth env var when `authEnvVar` is set → `AUTH_MISSING`
-- [ ] Network error during blob fetch (simulated via bad remote) → `BLOB_FETCH_TIMEOUT`
-- [ ] Concurrent external write creating a non-fast-forward → `CONCURRENT_WRITE` on `push()`
+- [ ] Missing `indexRef` → `BRANCH_NOT_FOUND` on preload
+- [ ] `authEnvVar` set but env var unset → `AUTH_MISSING`
+- [ ] Reading a never-preloaded, never-written filename returns `null` (matches upstream contract)
+- [ ] Push rejected as non-fast-forward → `CONCURRENT_WRITE`
 
-Host library compatibility:
+### `tests/integration/vector-store.test.ts`
 
-- [ ] The full js-doc-store FileStorageAdapter test suite passes when substituted with GitDocStoreAdapter against the fixture repo
+Targets `VectorStore(adapter, dim)` from js-vector-store.
 
-### `tests/integration/vector-adapter.test.ts`
-
-- [ ] `similaritySearch` with `rerankMode: "none"` fetches exactly `probes` cell blobs and returns top-K from those
-- [ ] `similaritySearch` with `rerankMode: "quantized-recall"` uses local quantized vectors for initial scoring and only fetches full-precision cells for the top candidates
-- [ ] Writing a vector causes its cell to be recomputed and the cell's blob rewritten
-- [ ] IVF centroids in index branch are treated as authoritative — adapter does NOT re-cluster on every write
-- [ ] Pinning `contentRef` to a SHA produces deterministic query results
+- [ ] `readBin`/`writeBin` round-trip an `ArrayBuffer` correctly
+- [ ] After `persist`, the `.bin` file lands on the content branch, the `.json` on the index branch
+- [ ] Pinning `contentRef` to a SHA produces deterministic data
 
 ### `tests/integration/concurrency.test.ts`
 
-Cross-process write coordination.
-
-- [ ] Two processes each trying to write the same collection serialize via flock
-- [ ] Stale lock (older than configured timeout) is stolen and replaced
-- [ ] Lock acquisition beyond `gitTimeoutMs` raises `LOCK_TIMEOUT`
+- [ ] Two adapter instances in the same process serialize persists correctly
+- [ ] Stale lock is stolen and replaced
+- [ ] Lock acquisition beyond `lockTimeoutMs` raises `LOCK_TIMEOUT`
 
 ## Performance / smoke benchmarks
 
-Not part of the correctness suite. Recorded in `tests/bench/` with output to `bench-results.json`.
+Optional, not part of the correctness suite.
 
 ### `tests/bench/cold-read.mjs`
 
-- Clone the fixture repo (1,000-doc collection) cold, read a random doc, measure end-to-end.
-- Target: < 500 ms on first read, < 20 ms on cached reads.
+- Clone a 1,000-doc fixture cold, preload, measure end-to-end. Target: < 500 ms.
 
 ### `tests/bench/vector-search.mjs`
 
-- Dataset: 100,000 vectors at 768 dims (Float32), IVF with 100 cells, 5 probes.
-- Target: p95 latency for `similaritySearch` under 300 ms cold, 50 ms warm.
-
-## Test data fixtures
-
-Under `tests/fixtures/sample-corpora/`:
-
-1. `small-docs/` — 10 collections × 100 docs each. Used for fast unit-adjacent integration tests.
-2. `medium-vectors/` — 1,000 vectors × 128 dims. Fits in memory, tests IVF correctness.
-3. `realistic-kb/` — 5,000 docs + 5,000 vectors × 768 dims. Used for bench.
-
-The fixtures are generated by a script (`tests/fixtures/generate.ts`), not committed. The script is deterministic (seeded), so fixtures regenerate identically.
+- 10,000 vectors × 768 dims. Target p95 < 300 ms cold, 50 ms warm.
 
 ## What we do NOT test
 
-- Network flakiness at the TCP level. Simulated via mock remote that delays/errors on request.
-- Cross-platform. Target Linux CI + macOS dev. Windows via WSL (not native — git behavior differs).
-- GitHub-specific features (LFS, commit signing policies, branch protection). Those are infra concerns, not library concerns.
+- Network flakiness at TCP level
+- GitHub-specific features (LFS, commit signing policies, branch protection)
+- CF Workers — deferred
 
-## Acceptance: what "green" means
+## Acceptance
 
-All tests pass, typecheck passes, lint passes, benchmarks meet targets. A single regression in any category blocks a release.
+All tests pass, typecheck passes, lint passes. Benchmarks recorded, not gating.

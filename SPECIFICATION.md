@@ -1,12 +1,12 @@
 # SPECIFICATION — js-git-store
 
-Detailed technical specification. The agent should read this before writing code to understand the *why* behind decisions encoded in CONTRACT.md. Narrative context that does NOT belong in the contract but DOES belong in the agent's head before coding.
+Detailed technical specification. The agent should read this before writing code to understand the *why* behind decisions encoded in CONTRACT.md.
 
 ## 1. What this project is
 
-`js-git-store` provides two pluggable storage adapters that let [`js-doc-store`](https://github.com/MauricioPerera/js-doc-store) and [`js-vector-store`](https://github.com/MauricioPerera/js-vector-store) persist their data in a git repository — with the specific layout "tree first, blob on demand". The result is a knowledge-base substrate that is:
+`js-git-store` provides a single pluggable storage adapter that lets [`js-doc-store`](https://github.com/MauricioPerera/js-doc-store) and [`js-vector-store`](https://github.com/MauricioPerera/js-vector-store) persist their data in a git repository — with the specific layout "tree first, blob on demand". The result is a knowledge-base substrate that is:
 
-- **Content-addressable**: every version of every record is a git SHA
+- **Content-addressable**: every version of every file is a git SHA
 - **Versioned by construction**: git log = full audit trail
 - **Distributed by default**: clone = replica; pull = sync
 - **Branch-oriented**: branches = dev/staging/prod or experiment variants
@@ -17,132 +17,104 @@ Detailed technical specification. The agent should read this before writing code
 Existing document and vector stores in JS land are:
 
 - **Ephemeral** (in-memory) — no versioning, no audit
-- **Filesystem-only** (FileStorageAdapter) — versioning = manual snapshots, no branching, no signatures
-- **KV-backed** (CF Workers KV) — no history, no branches, not portable
+- **Filesystem-only** (`FileStorageAdapter`) — versioning = manual snapshots, no branching, no signatures
+- **KV-backed** (`CloudflareKVAdapter`) — no history, no branches, not portable
 
-Commercial products with version semantics (Dolt, Datomic, LakeFS) are Go/JVM/closed, not JS-native, not edge-deployable.
+This project fills the gap: **git-native storage for structured JS data**, usable for knowledge bases, config stores, versioned RAG, any read-heavy domain where history matters.
 
-This project fills the gap: **git-native storage for structured JS data**, usable for knowledge bases, config stores, knowledge graphs, versioned RAG, any read-heavy domain where history matters.
+## 3. The real StorageAdapter contract (verified 2026-04-19)
 
-## 3. The "tree first, blob on demand" pattern
+The upstream adapter interface is **sync read/write + async preload/persist** (same shape as the existing `VercelBlobAdapter` and `CloudflareKVAdapter`):
 
-A single git repository holds two refs that serve different purposes:
+```ts
+interface StorageAdapter {
+  readJson(filename: string): unknown | null;       // sync, from cache
+  writeJson(filename: string, data: unknown): void; // sync, into cache
+  readBin?(filename: string): ArrayBuffer | null;   // sync, from cache (vector)
+  writeBin?(filename: string, buf: ArrayBuffer | Uint8Array): void;
+  delete(filename: string): void;
 
-### `index` branch (orphan — no shared history with main)
-
-Small. Contains only metadata + partitions:
-
-```
-index/
-├── manifest.json              # top-level pointers
-├── collections/
-│   ├── users.meta.json        # schema, count, last-modified, etc.
-│   ├── users.idx.email.json   # email index (hash or sorted)
-│   └── users.idx.age.json
-└── vectors/
-    ├── embeddings.centroids.bin    # IVF centroids (~KB)
-    ├── embeddings.cell-map.json    # "cell N → [vec IDs]"
-    └── embeddings.quantized.bin    # 1-bit recall vectors (optional)
+  preload?(filenames: string[]): Promise<void>;     // hydrate cache from remote
+  persist?(): Promise<void>;                         // flush dirty cache to remote
+}
 ```
 
-Clients clone this branch **shallow and full** (`--depth=1 --single-branch`). Total size typically < 100 MB even for million-document datasets. They can keep it forever in local cache.
+Host libraries pick filenames following known shapes:
 
-### `main` branch (content)
+- DocStore: `<col>.docs.json`, `<col>.meta.json`, `<col>.<field>.idx.json`, `<col>.<field>.sidx.json`
+- VectorStore: `<col>.bin|q8.bin|b1.bin`, `<col>.json|q8.json|b1.json`
 
-Contains the heavy blobs:
+The adapter treats filenames as opaque — it never parses or reconstructs them.
 
-```
-main/
-├── collections/
-│   ├── users.docs.jsonl       # full documents, one per line
-│   └── orders.docs.jsonl
-└── vectors/
-    ├── embeddings/
-    │   ├── cell-0000.vec.bin  # full-precision vectors in IVF cell 0
-    │   ├── cell-0001.vec.bin
-    │   └── ...
-    └── embeddings.docs.jsonl  # metadata per vector
-```
+## 4. The "tree first, blob on demand" pattern
 
-Clients clone this branch **partial** (`--filter=blob:none`). Git fetches blobs lazily when accessed. Typical pattern:
+The adapter uses **two git refs** for different file-weight classes.
 
-1. Agent asks js-doc-store for `users.find({email: "x@y"})`
-2. Adapter reads `users.idx.email.json` (already local from index branch)
-3. Index says matching docs are at file offset ranges within `users.docs.jsonl`
-4. Adapter triggers `git fetch <content-ref>:collections/users.docs.jsonl` — pulls only that file's blob
-5. Reads offsets, returns matching docs
+### `index` branch (orphan — light files, shallow clone)
 
-For vectors it's cleaner because IVF already partitions:
+Always-local, always-fresh. Holds the "light" files that hosts need on every operation:
 
-1. Agent asks js-vector-store for `similaritySearch(queryVec, topK=10, probes=5)`
-2. Adapter uses local centroids to identify 5 cells
-3. Adapter `git fetch`es those 5 cell blobs
-4. Scores, returns top-10
+- `<col>.meta.json`
+- `<col>.<field>.idx.json` / `.sidx.json`
+- `<col>.json` / `<col>.q8.json` / `<col>.b1.json`
 
-## 4. Architectural invariants
+Clients clone this branch `--depth=1 --single-branch`. Typical size < 100 MB.
 
-### Writes go through a commit queue
+### `main` content branch (heavy files, partial clone)
 
-All mutations are serialized in-process via a mutex. Two `insert()` calls made concurrently are committed one after the other, not merged into one commit. This keeps commit history readable and avoids git locking issues.
+Holds the bulk of the data:
 
-Cross-process concurrency: the same `open(path, 'wx')` flock pattern used by a2e-shell's catalog cache. If another process holds the lock, wait-and-retry up to the configured timeout.
+- `<col>.docs.json` (can be tens of MB per collection)
+- `<col>.bin` / `<col>.q8.bin` / `<col>.b1.bin` (vector blobs, can be GB)
 
-### Reads never hit the remote unless the blob is absent locally
+Clients clone with `--filter=blob:none --no-checkout`. Git fetches blobs lazily when `git show HEAD:<path>` is invoked. The adapter caches those blobs in memory under `localCacheDir`, bounded by `maxCacheBytes` (LRU eviction).
 
-Local cache is authoritative for reads. The adapter only triggers `git fetch` on a cache miss. Successful fetches populate the local cache atomically (tmp + fsync + rename).
+### Routing
 
-### Index branch is regenerated, not incrementally edited
+The `heavyFileRegex` config decides which branch a filename lives on. Default: `/\.(bin|docs\.json)$/`. Callers can override for custom schemas.
 
-A write mutates `main` (append to `users.docs.jsonl`, add new vector cell, etc.), then triggers an index regeneration. The regenerator reads the mutated content and rewrites the relevant `index` branch files.
+### Lifecycle example — DocStore query
 
-Two strategies for triggering:
-- **Eager**: every write regenerates the affected index files immediately and includes them in the same commit
-- **Batched**: writes stack, a background flush regenerates + commits every N ops or every T seconds (analogous to a WAL)
+1. Caller runs `await adapter.preload(["users.docs.json", "users.meta.json"])`
+2. `users.meta.json` matches the index regex → read from the shallow index worktree (always local)
+3. `users.docs.json` matches heavy regex → `git show HEAD:users.docs.json` in the content clone triggers a partial-clone blob fetch; the resulting buffer goes into the in-memory cache
+4. `new DocStore(adapter).collection("users").find(...)` runs; it calls the sync `readJson("users.docs.json")` which returns the cached array
+5. An insert triggers `writeJson("users.docs.json", [...updated])` — cache entry marked dirty
+6. `adapter.persist()` writes the dirty file to the content worktree, `git add` + `git commit` on contentRef. Meta/index updates (if any) commit on indexRef.
+7. Optional `adapter.push()` or `pushOnPersist: true`
 
-MVP: eager. Batching is a v0.2 enhancement.
+## 5. Architectural invariants
 
-### Push is caller-controlled
+### Sync reads/writes never touch git
 
-`autoCommit: true` (default) means every write creates a commit. `pushOnWrite: false` (default) means the adapter does NOT push automatically. The caller decides when to push — after a batch of ops, on shutdown, on explicit `flush()`.
+This is the whole point of the sync-cache pattern. Reads return null for unloaded files; callers are expected to `preload` first. Writes stage in memory; durability is only reached through `persist()`.
 
-This matters because:
-- Most use cases do many writes then one push
-- Pushing per-op would make throughput unusable
-- Integrating with PR workflows means the caller might want to push to a feature branch and open a PR, not push to main
+### Persist is serialized
 
-## 5. Why IVF is a natural fit (vector adapter specific)
+In-process: a single commit queue. Cross-process: a file lock at `<cacheDir>/.lock`, stolen if stale past `staleLockMs`.
 
-IVF (Inverted File Index) partitions the vector space into cells via k-means. Each vector belongs to one cell. A query finds the top-k nearest cells to the query vector, then scores vectors only within those cells.
+### Reads never hit the remote unless missing locally
 
-This maps 1:1 to git tree structure:
+Local cache is authoritative. `preload` triggers git fetches only on cache miss. Successful fetches are cached in memory (and the git object DB, via partial clone).
 
-```
-vectors/embeddings/
-├── cell-0000.vec.bin
-├── cell-0001.vec.bin
-├── ...
-```
+### Push is explicit unless `pushOnPersist` is true
 
-Query cost = k cell fetches. For k=5 probes on a 1M-vector dataset with 1000 cells, a query fetches ~5 MB of blobs instead of downloading the full 3 GB corpus.
+Most callers do many ops then one push. `pushOnPersist: true` is a convenience for auto-sync setups.
 
-Matryoshka-style re-ranking works naturally on top:
-1. Load quantized 1-bit recall vectors from the index branch (already local, ~92 MB for 1M vectors)
-2. Score approximately, pick top-100 candidates
-3. Fetch full-precision vectors for only those 100 from the content branch
-4. Re-rank with full-precision cosine
+### Content branch uses partial clone; index does not
 
-This combination (quantized local + full-precision on-demand) is what makes the git-backed vector store genuinely competitive with server-based stores for moderate-scale RAG.
+Partial clone (`--filter=blob:none`) requires the remote to allow it. file://, GitHub, GitLab all do. For niche remotes that don't, the adapter surfaces a clear error.
 
 ## 6. Scale ceiling (honest)
 
 ### Reads
 
-- Tree index branch: practical ceiling ~100 MB. That corresponds to ~1M vectors quantized to 1-bit, or ~10M docs of pure metadata. Past that, the index gets slow to clone.
-- Blob fetch latency: ~10-100 ms per fetch (network RTT dominated). Fine for retrieval, bad for real-time queries at > 10 qps.
+- Index branch: practical ceiling ~100 MB of light files. Past that, the shallow clone slows down.
+- Blob fetch latency: ~10-100 ms per heavy file on first access (network RTT dominated). Fine for offline-preload-heavy workflows, bad for > 10 qps real-time.
 
 ### Writes
 
-- Per-commit overhead: ~50-200 ms (spawn git + hash + commit). Batching to 100 ops per commit = 1000 writes/sec theoretical.
+- Per-commit overhead: ~50-200 ms (spawn git + hash + commit). Persisting a batch of 100 changed files = one commit per branch = ~400 ms typical.
 - Cross-process contention: serialized via flock. A hot repo with 10 writers will queue up.
 
 ### What you SHOULDN'T build with this
@@ -151,7 +123,7 @@ This combination (quantized local + full-precision on-demand) is what makes the 
 - Logs, metrics, telemetry
 - Multi-tenant shared state (one repo per tenant doesn't scale)
 - Real-time collaborative editing
-- Billion-scale vector search (we're targeting edge + medium scale, not Pinecone replacement)
+- Billion-scale vector search
 
 ### What you SHOULD build with this
 
@@ -163,38 +135,30 @@ This combination (quantized local + full-precision on-demand) is what makes the 
 
 ## 7. Integration with the broader a2e ecosystem
 
-This project was conceived during work on [a2e-shell](https://github.com/MauricioPerera/a2e-shell), an HTTP server that exposes bash as a primitive tool for LLM agents, and [a2e-skills](https://github.com/MauricioPerera/a2e-skills), a git-backed catalog of skills/docs/prompts/templates consumed by a2e-shell.
+This project was conceived during work on [a2e-shell](https://github.com/MauricioPerera/a2e-shell) and [a2e-skills](https://github.com/MauricioPerera/a2e-skills). a2e-skills today uses CI-regenerated index branch + manual file writes. Migration to `js-git-store` replaces `tools/gen-index.ts` + `tools/push-index.sh` with programmatic writes through the adapter.
 
-a2e-skills today uses a CI-regenerated index branch and manual file writes. Migration to js-git-store would:
+The example in `examples/skills-catalog/` demonstrates the migration using a real `DocStore` instance pointed at the adapter.
 
-- Replace `tools/gen-index.ts` + `tools/push-index.sh` with programmatic writes through the doc adapter
-- Enable new skill types: skills with a vector-indexed description (for semantic skill discovery via js-vector-store)
-- Keep the on-disk layout compatible so a2e-shell's current catalog consumer (which reads `skills.json` partitions) keeps working
-
-The example in `examples/skills-catalog/` MUST demonstrate this migration.
-
-## 8. Success criteria (beyond the contract)
-
-A "v1.0 candidate" exists when:
-
-- An agent can bootstrap a session that pins both a doc-store AND a vector-store to specific commits (reproducible RAG)
-- A skill repo maintainer can `git log` to see exactly who added which skill when and why (commit messages written by the adapter on their behalf)
-- A second machine can clone the repo and have a fully-functional local replica with zero setup beyond `git clone + npm install`
-- The adapters perform within the latency bounds of section 6 on a realistic dataset (see `examples/` for realistic)
-
-## 9. Explicit non-goals
+## 8. Explicit non-goals
 
 - Do not build a web UI. This is a library.
-- Do not build a REST/HTTP server. That's the caller's job (a2e-shell style).
+- Do not build a REST/HTTP server. That's the caller's job.
 - Do not implement replication between multiple git hosts. Git's built-in remotes are enough.
 - Do not implement transactions across repos. One repo = one "database".
-- Do not compete with Dolt/Datomic on SQL/query richness. Inherit whatever js-doc-store provides.
-- Do not attempt to deduplicate across collections. Each collection is independent.
+- Do not compete on SQL/query richness. Inherit whatever the host library provides.
+- Do not deduplicate across collections.
 
-## 10. What the agent SHOULD cross-reference before writing code
+## 9. What to cross-reference before writing code
 
-1. Read the `StorageAdapter` interface in js-doc-store source — this is the contract the doc adapter must satisfy exactly
-2. Read the `StorageAdapter` interface in js-vector-store source — same for the vector adapter
-3. Read `a2e-shell/src/catalog/cache.ts` — this is the canonical implementation of "shallow clone + partial fetch + LRU + flock" that js-git-store is extracting/generalizing. Treat it as reference code, not as something to copy
-4. Read `a2e-skills/tools/gen-index.ts` and `a2e-skills/tools/push-index.sh` — the existing write-side flow
-5. Read `a2e-skills/INDEX-SCHEMA.json` — the schema conventions js-doc-store's doc adapter's index branch will echo
+1. [`js-doc-store/js-doc-store.js`](https://github.com/MauricioPerera/js-doc-store/blob/master/js-doc-store.js) — `FileStorageAdapter` at L210, `Collection._ensureLoaded` at L754, `DocStore(dirOrAdapter)` at L1138
+2. [`js-vector-store/js-vector-store.js`](https://github.com/MauricioPerera/js-vector-store/blob/master/js-vector-store.js) — `FileStorageAdapter` at L301 (adds `readBin/writeBin`)
+3. [`js-doc-store/vercel-blob-adapter.js`](https://github.com/MauricioPerera/js-doc-store/blob/master/vercel-blob-adapter.js) — canonical sync-cache + async-persist pattern
+4. [a2e-shell/src/catalog/cache.ts](https://github.com/MauricioPerera/a2e-shell) — shallow clone + partial fetch + flock reference
+5. [a2e-skills/tools/gen-index.ts](https://github.com/MauricioPerera/a2e-skills) — existing write-side flow
+
+## 10. What "v1.0 candidate" means
+
+- An agent can bootstrap a session that pins a DocStore+VectorStore pair to specific commits (reproducible RAG)
+- A skill-repo maintainer can `git log` to see exactly who added which skill when and why
+- A second machine `git clone`s and has a fully-functional local replica
+- Adapters perform within the latency bounds of section 6 on a realistic dataset
