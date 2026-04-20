@@ -48,7 +48,15 @@ jobs:
           node-version: '20'
           cache: 'npm'
       - run: npm ci --no-audit --no-fund
-      - name: cold-read bench
+      - name: cold-read (gated)
         env:
           BENCH_GATE: '1'
         run: npm run bench:cold-read
+      - name: vector-load (gated)
+        env:
+          BENCH_GATE: '1'
+        run: npm run bench:vector-load
+      - name: persist-throughput (smoke, no gate)
+        run: npm run bench:persist
+      - name: cache-eviction (correctness check)
+        run: npm run bench:cache-eviction
